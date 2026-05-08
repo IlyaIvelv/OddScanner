@@ -1,0 +1,44 @@
+server:
+  port: 8080
+
+spring:
+  datasource:
+    url: jdbc:postgresql://localhost:5432/oddscanner
+    username: user
+    password: password
+    driver-class-name: org.postgresql.Driver
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+# JOOQ Configuration (if needed for runtime, but mostly for codegen)
+jooq:
+  sql-dialect: POSTGRES
+
+oddscanner:
+  refresh:
+    global-seconds: 30
+  bookmakers:
+    fonbet:
+      enabled: true
+      base-url: https://www.fon.bet
+      refresh-seconds: 30
+    marathon:
+      enabled: true
+      base-url: https://www.marathonbet.com
+      refresh-seconds: 60
+  scanner:
+    trigger-mode: HYBRID # AFTER_INGEST | SCHEDULED | HYBRID
+    cron: "*/30 * * * * *"
+    debounce-ms: 1500
+    min-profit-pct: 0.5
+  normalization:
+    team-similarity-threshold: 0.88
+    start-time-window-min: 5
+
+springdoc:
+  api-docs:
+    path: /api-docs
+  swagger-ui:
+    path: /swagger-ui.html
