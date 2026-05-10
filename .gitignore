@@ -1,2 +1,9 @@
 # jOOQ generated sources
 src/main/java/com/oddscanner/generated/
+
+# Compiled class files
+**/*.class
+
+# Также, возможно, стоит игнорировать итоговые JAR/WAR файлы
+*.jar
+*.war

@@ -23,6 +23,7 @@
         <jooq.version>3.19.8</jooq.version>
         <commons-text.version>1.12.0</commons-text.version>
         <springdoc.version>2.5.0</springdoc.version>
+        <argLine>-Dfile.encoding=UTF-8</argLine>
     </properties>
 
     <dependencies>
@@ -113,6 +114,44 @@
                 </configuration>
             </plugin>
             <!-- JOOQ Codegen Plugin will be added later after DB init -->
+            <plugin>
+                <groupId>org.jooq</groupId>
+                <artifactId>jooq-codegen-maven</artifactId>
+                <version>${jooq.version}</version>
+                <executions>
+                    <execution>
+                        <id>generate-jooq-sources</id>
+                        <phase>generate-sources</phase>
+                        <goals>
+                            <goal>generate</goal>
+                        </goals>
+                    </execution>
+                </executions>
+                <configuration>
+                    <!-- ДОБАВЬ ЭТУ СТРОКУ -->
+                    <onError>SILENT</onError>
+
+                    <jdbc>
+                        <driver>org.postgresql.Driver</driver>
+                        <url>jdbc:postgresql://localhost:5433/oddscanner</url>
+                        <user>user</user>
+                        <password>password</password>
+                    </jdbc>
+                    <generator>
+                        <name>org.jooq.codegen.JavaGenerator</name>
+                        <database>
+                            <name>org.jooq.meta.postgres.PostgresDatabase</name>
+                            <includes>.*</includes>
+                            <excludes>flyway_schema_history</excludes>
+                            <inputSchema>public</inputSchema>
+                        </database>
+                        <target>
+                            <packageName>com.oddscanner.generated</packageName>
+                            <directory>src/main/java</directory>
+                        </target>
+                    </generator>
+                </configuration>
+            </plugin>
         </plugins>
     </build>
 </project>
