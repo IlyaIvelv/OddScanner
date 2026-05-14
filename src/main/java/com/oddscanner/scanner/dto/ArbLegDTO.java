@@ -1,23 +1,44 @@
-
+// File: src/main/java/com/oddscanner/scanner/dto/ArbLegDTO.java
 package com.oddscanner.scanner.dto;
 
-import lombok.AllArgsConstructor;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.annotation.JsonPOJOBuilder;
 import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import lombok.Value;
 
 import java.math.BigDecimal;
 
-// DTO для представления одной "ноги" вилки
-@Data // Заменяет @Getter, @Setter, @ToString, @EqualsAndHashCode, @RequiredArgsConstructor
-@NoArgsConstructor // Генерирует конструктор без аргументов
-@AllArgsConstructor // Генерирует конструктор со всеми аргументами
-@Builder // Позволяет использовать Builder-паттерн
+@Value
+@Builder(toBuilder = true)
+@JsonDeserialize(builder = ArbLegDTO.ArbLegDTOBuilder.class)
 public class ArbLegDTO {
+    Long outcomeId;
+    Long marketId;
+    String outcomeKey;
+    BigDecimal odds;
+    BigDecimal stakeShare;
 
-    private Long outcomeId; // ID исхода
-    private Long marketId; // ID рынка
-    private String outcomeKey; // Ключ исхода (OVER, UNDER, HOME, AWAY, etc.)
-    private BigDecimal odds; // Коэффициент
-    private BigDecimal stakeShare; // Доля ставки (например, 0.5 для 50%)
+    @JsonCreator
+    private ArbLegDTO(@JsonProperty("outcomeId") Long outcomeId,
+                      @JsonProperty("marketId") Long marketId,
+                      @JsonProperty("outcomeKey") String outcomeKey,
+                      @JsonProperty("odds") BigDecimal odds,
+                      @JsonProperty("stakeShare") BigDecimal stakeShare) {
+        this.outcomeId = outcomeId;
+        this.marketId = marketId;
+        this.outcomeKey = outcomeKey;
+        this.odds = odds;
+        this.stakeShare = stakeShare;
+    }
+
+    // ИСПРАВЛЕНО: теперь возвращает правильный билдер
+    public static ArbLegDTOBuilder builder() {
+        return new ArbLegDTOBuilder();
+    }
+
+    @JsonPOJOBuilder(withPrefix = "")
+    public static class ArbLegDTOBuilder {
+    }
 }

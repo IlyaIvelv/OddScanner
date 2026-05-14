@@ -1,5 +1,4 @@
 // File: src/main/java/com/oddscanner/scanner/ArbFinderService.java
-
 package com.oddscanner.scanner;
 
 import com.oddscanner.generated.Tables;
@@ -23,22 +22,21 @@ import java.util.stream.Collectors;
 
 @Service
 public class ArbFinderService {
-
     private static final Logger log = LoggerFactory.getLogger(ArbFinderService.class);
 
     private final DSLContext dsl;
     private final ArbCalculator arbCalculator;
     private final OutcomeRepository outcomeRepo;
-    private final ArbOpportunityRepository arbOpportunityRepo; // <-- Добавлен
-    private final ArbLegRepository arbLegRepo; // <-- Добавлен
-    private final ApplicationEventPublisher eventPublisher; // <-- Добавлен для публикации события
+    private final ArbOpportunityRepository arbOpportunityRepo;
+    private final ArbLegRepository arbLegRepo;
+    private final ApplicationEventPublisher eventPublisher;
 
     public ArbFinderService(DSLContext dsl,
                             ArbCalculator arbCalculator,
                             OutcomeRepository outcomeRepo,
-                            ArbOpportunityRepository arbOpportunityRepo, // <-- Внедряем
-                            ArbLegRepository arbLegRepo, // <-- Внедряем
-                            ApplicationEventPublisher eventPublisher) { // <-- Внедряем
+                            ArbOpportunityRepository arbOpportunityRepo,
+                            ArbLegRepository arbLegRepo,
+                            ApplicationEventPublisher eventPublisher) {
         this.dsl = dsl;
         this.arbCalculator = arbCalculator;
         this.outcomeRepo = outcomeRepo;
@@ -58,7 +56,6 @@ public class ArbFinderService {
         // Получаем все *активные* исходы
         List<OutcomesRecord> allActiveOutcomes = dsl.selectFrom(Tables.OUTCOMES)
                 .where(Tables.OUTCOMES.IS_ACTIVE.isTrue())
-                // .and(Tables.OUTCOMES.UPDATED_AT.greaterThan(someRecentTime)) // Оптимизация: сканировать только недавно обновлённые
                 .fetchInto(OutcomesRecord.class);
 
         log.info("Scanning {} active outcomes for arbitrage...", allActiveOutcomes.size());
@@ -104,8 +101,6 @@ public class ArbFinderService {
         var existingOpportunityOpt = arbOpportunityRepo.findByEventIdAndMarketSignature(opportunity.getEventId(), opportunity.getMarketSignature());
         if (existingOpportunityOpt.isPresent()) {
             log.debug("Arbitrage opportunity for event {} and signature {} already exists. Updating or skipping.", opportunity.getEventId(), opportunity.getMarketSignature());
-            // В реальности можно обновить время found_at или просто пропустить
-            // arbOpportunityRepo.updateLastSeen(existingOpportunityOpt.get().getId()); // Метод нужно добавить, если хочешь обновлять
             return;
         }
 
@@ -114,8 +109,8 @@ public class ArbFinderService {
         opportunityRecord.setEventId(opportunity.getEventId());
         opportunityRecord.setMarketSignature(opportunity.getMarketSignature());
         opportunityRecord.setProfitPct(opportunity.getProfitPercentage());
-        opportunityRecord.setFoundAt(opportunity.getFoundAt().atOffset(ZoneOffset.UTC)); // Сохраняем как OffsetDateTime
-        opportunityRecord.setStatus("ACTIVE"); // Устанавливаем статус ACTIVE
+        opportunityRecord.setFoundAt(opportunity.getFoundAt().atOffset(ZoneOffset.UTC));
+        opportunityRecord.setStatus("ACTIVE");
 
         var savedOpportunityRecord = arbOpportunityRepo.save(opportunityRecord);
         Long savedArbId = savedOpportunityRecord.getId();
@@ -124,8 +119,8 @@ public class ArbFinderService {
         // 3. Сохранить "ноги" вилки
         for (ArbLegDTO leg : opportunity.getLegs()) {
             var legRecord = new com.oddscanner.generated.tables.records.ArbLegsRecord();
-            legRecord.setArbId(savedArbId); // Связываем с основной вилкой
-            legRecord.setBookmakerId(findBookmakerIdByOutcomeId(leg.getOutcomeId())); // Нужно получить ID букмекера по ID исхода
+            legRecord.setArbId(savedArbId);
+            legRecord.setBookmakerId(findBookmakerIdByOutcomeId(leg.getOutcomeId()));
             legRecord.setMarketId(leg.getMarketId());
             legRecord.setOutcomeId(leg.getOutcomeId());
             legRecord.setOdds(leg.getOdds());
@@ -142,7 +137,6 @@ public class ArbFinderService {
 
     // Вспомогательный метод для получения bookmaker_id по outcome_id (нужно выполнить JOIN)
     private Long findBookmakerIdByOutcomeId(Long outcomeId) {
-        // SELECT m.bookmaker_id FROM outcomes o JOIN markets m ON o.market_id = m.id WHERE o.id = ?
         return dsl.select(Tables.MARKETS.BOOKMAKER_ID)
                 .from(Tables.OUTCOMES)
                 .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))

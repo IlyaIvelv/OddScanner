@@ -1,35 +1,47 @@
 // File: src/main/java/com/oddscanner/scanner/dto/ArbitrageOpportunityDTO.java
-
 package com.oddscanner.scanner.dto;
 
-import lombok.AllArgsConstructor;
+import com.fasterxml.jackson.annotation.JsonCreator;
+import com.fasterxml.jackson.annotation.JsonIgnore;
+import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.databind.annotation.JsonDeserialize;
+import com.fasterxml.jackson.databind.annotation.JsonPOJOBuilder;
 import lombok.Builder;
-import lombok.Data;
-import lombok.NoArgsConstructor;
+import lombok.Value;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
 import java.util.List;
 
-// DTO для представления найденной арбитражной возможности
-@Data // Заменяет @Getter, @Setter, @ToString, @EqualsAndHashCode, @RequiredArgsConstructor
-@NoArgsConstructor // Генерирует конструктор без аргументов
-@AllArgsConstructor // Генерирует конструктор со всеми аргументами
-@Builder // Позволяет использовать Builder-паттерн
+@Value
+@Builder(toBuilder = true)
+@JsonDeserialize(builder = ArbitrageOpportunityDTO.ArbitrageOpportunityDTOBuilder.class)
 public class ArbitrageOpportunityDTO {
+    Long eventId;
+    String marketSignature;
+    BigDecimal profitPercentage;
+    LocalDateTime foundAt;
+    List<ArbLegDTO> legs;
 
-    private Long eventId; // ID внутреннего события
-    private String marketSignature; // Уникальный ключ рынка (event_id, market_type, period, line)
-    private BigDecimal profitPercentage; // Процент прибыли
-    private List<ArbLegDTO> legs; // Ноги вилки (конкретные ставки)
-    private LocalDateTime foundAt; // Время нахождения (установится в конструкторе или сеттере)
-
-    // Конструктор, который устанавливает foundAt при создании
-    public ArbitrageOpportunityDTO(Long eventId, String marketSignature, BigDecimal profitPercentage, List<ArbLegDTO> legs) {
+    @JsonCreator
+    private ArbitrageOpportunityDTO(@JsonProperty("eventId") Long eventId,
+                                    @JsonProperty("marketSignature") String marketSignature,
+                                    @JsonProperty("profitPercentage") BigDecimal profitPercentage,
+                                    @JsonProperty("foundAt") LocalDateTime foundAt,
+                                    @JsonProperty("legs") List<ArbLegDTO> legs) {
         this.eventId = eventId;
         this.marketSignature = marketSignature;
         this.profitPercentage = profitPercentage;
+        this.foundAt = foundAt != null ? foundAt : LocalDateTime.now();
         this.legs = legs;
-        this.foundAt = LocalDateTime.now(); // Устанавливаем время создания
+    }
+
+    // Дополнительный конструктор для упрощения создания в ArbCalculator
+    public ArbitrageOpportunityDTO(Long eventId, String marketSignature, BigDecimal profitPercentage, List<ArbLegDTO> legs) {
+        this(eventId, marketSignature, profitPercentage, LocalDateTime.now(), legs);
+    }
+
+    @JsonPOJOBuilder(withPrefix = "")
+    public static class ArbitrageOpportunityDTOBuilder {
     }
 }

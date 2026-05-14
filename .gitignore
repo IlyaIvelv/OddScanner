@@ -1,9 +1,18 @@
+# Target directory (Maven)
+target/
+**/target/
+
 # jOOQ generated sources
 src/main/java/com/oddscanner/generated/
 
 # Compiled class files
 **/*.class
 
-# Также, возможно, стоит игнорировать итоговые JAR/WAR файлы
+# JAR/WAR files
 *.jar
 *.war
+
+# IDE files (на всякий случай)
+.idea/
+*.iml
+.DS_Store
