@@ -41,6 +41,19 @@ oddscanner:
     team-similarity-threshold: 0.88
     start-time-window-min: 5
 
+# Настройки планировщика
+scheduler:
+  enabled: true
+  fixed-delay-ms: 300000  # 5 минут (300 000 мс)
+  # fixed-delay-ms: 600000  # 10 минут
+  # fixed-delay-ms: 900000  # 15 минут
+
+# Логирование
+logging:
+  level:
+    com.oddscanner: DEBUG
+    com.microsoft.playwright: INFO
+
 springdoc:
   api-docs:
     path: /api-docs

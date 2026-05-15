@@ -17,7 +17,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 
-@Component
+//@Component
 public class TheSportsDbAdapter implements BookmakerAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(TheSportsDbAdapter.class);
@@ -50,10 +50,10 @@ public class TheSportsDbAdapter implements BookmakerAdapter {
 
                 LocalDateTime startTime = LocalDateTime.parse(dateStr + "T" + timeStr,
                         DateTimeFormatter.ISO_LOCAL_DATE_TIME);
-
+//TODO
                 RawEvent event = new RawEvent(
-                        id, homeTeam, awayTeam, startTime,
-                        "Football", "Premier League", new ArrayList<>()
+//                        id, homeTeam, awayTeam, startTime,
+//                        "Football", "Premier League", new ArrayList<>()
                 );
                 events.add(event);
                 log.debug("Событие: {} vs {} (ID: {})", homeTeam, awayTeam, id);

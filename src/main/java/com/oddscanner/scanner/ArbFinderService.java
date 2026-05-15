@@ -15,6 +15,12 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
+import java.util.LinkedHashMap;
+import java.util.Map;
+import com.oddscanner.generated.tables.records.EventsRecord;
+import com.oddscanner.generated.tables.records.TeamsRecord;
+import java.util.LinkedHashMap;
+import java.util.Map;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
@@ -299,5 +305,85 @@ public class ArbFinderService {
                 .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))
                 .where(Tables.OUTCOMES.ID.eq(outcomeId))
                 .fetchOneInto(Long.class);
+    }
+
+    public List<Map<String, Object>> getArbsWithDetails() {
+        log.info("=== ПОЛУЧЕНИЕ ВИЛОК С ДЕТАЛЯМИ ===");
+
+        List<Map<String, Object>> result = new ArrayList<>();
+
+        // Создаем алиасы для таблиц (используем Table, а не Record)
+        var homeTeamAlias = Tables.TEAMS.as("home_team");
+        var awayTeamAlias = Tables.TEAMS.as("away_team");
+
+        var arbs = dsl.select(
+                        Tables.ARB_OPPORTUNITIES.ID,
+                        Tables.ARB_OPPORTUNITIES.EVENT_ID,
+                        Tables.ARB_OPPORTUNITIES.PROFIT_PCT,
+                        Tables.ARB_OPPORTUNITIES.STATUS,
+                        Tables.ARB_OPPORTUNITIES.FOUND_AT,
+                        Tables.EVENTS.EVENT_URL,
+                        homeTeamAlias.CANONICAL_NAME.as("home_team"),
+                        awayTeamAlias.CANONICAL_NAME.as("away_team"),
+                        Tables.EVENTS.START_TIME
+                )
+                .from(Tables.ARB_OPPORTUNITIES)
+                .join(Tables.EVENTS).on(Tables.ARB_OPPORTUNITIES.EVENT_ID.eq(Tables.EVENTS.ID))
+                .join(homeTeamAlias).on(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamAlias.ID))
+                .join(awayTeamAlias).on(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamAlias.ID))
+                .where(Tables.ARB_OPPORTUNITIES.STATUS.eq("ACTIVE"))
+                .fetch();
+
+        for (var arb : arbs) {
+            Map<String, Object> arbMap = new LinkedHashMap<>();
+            arbMap.put("id", arb.get(Tables.ARB_OPPORTUNITIES.ID));
+            arbMap.put("eventId", arb.get(Tables.ARB_OPPORTUNITIES.EVENT_ID));
+            arbMap.put("homeTeam", arb.get("home_team", String.class));
+            arbMap.put("awayTeam", arb.get("away_team", String.class));
+            arbMap.put("eventUrl", arb.get(Tables.EVENTS.EVENT_URL));
+            arbMap.put("profitPercentage", arb.get(Tables.ARB_OPPORTUNITIES.PROFIT_PCT));
+            arbMap.put("status", arb.get(Tables.ARB_OPPORTUNITIES.STATUS));
+            arbMap.put("foundAt", arb.get(Tables.ARB_OPPORTUNITIES.FOUND_AT));
+
+            // Получаем ноги (лега) для этой вилки
+            var legs = dsl.select(
+                            Tables.ARB_LEGS.ID,
+                            Tables.ARB_LEGS.OUTCOME_ID,
+                            Tables.ARB_LEGS.ODDS,
+                            Tables.ARB_LEGS.STAKE_SHARE,
+                            Tables.OUTCOMES.OUTCOME_KEY,
+                            Tables.OUTCOMES.VALUE,  // Убираем .as("outcome_name") или используем так
+                            Tables.MARKETS.MARKET_TYPE,
+                            Tables.BOOKMAKERS.CODE.as("bookmaker_code"),
+                            Tables.BOOKMAKERS.NAME.as("bookmaker_name")
+                    )
+                    .from(Tables.ARB_LEGS)
+                    .join(Tables.OUTCOMES).on(Tables.ARB_LEGS.OUTCOME_ID.eq(Tables.OUTCOMES.ID))
+                    .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))
+                    .join(Tables.BOOKMAKERS).on(Tables.ARB_LEGS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
+                    .where(Tables.ARB_LEGS.ARB_ID.eq(arb.get(Tables.ARB_OPPORTUNITIES.ID)))
+                    .fetch();
+
+            List<Map<String, Object>> legList = new ArrayList<>();
+            for (var leg : legs) {
+                Map<String, Object> legMap = new LinkedHashMap<>();
+                legMap.put("id", leg.get(Tables.ARB_LEGS.ID));
+                legMap.put("outcomeId", leg.get(Tables.ARB_LEGS.OUTCOME_ID));
+                legMap.put("outcomeKey", leg.get(Tables.OUTCOMES.OUTCOME_KEY));
+                legMap.put("outcomeName", leg.get(Tables.OUTCOMES.VALUE));
+                legMap.put("odds", leg.get(Tables.ARB_LEGS.ODDS));
+                legMap.put("stakeShare", leg.get(Tables.ARB_LEGS.STAKE_SHARE));
+                legMap.put("bookmakerCode", leg.get("bookmaker_code", String.class));
+                legMap.put("bookmakerName", leg.get("bookmaker_name", String.class));
+                legMap.put("marketType", leg.get(Tables.MARKETS.MARKET_TYPE));
+                legList.add(legMap);
+            }
+
+            arbMap.put("legs", legList);
+            result.add(arbMap);
+        }
+
+        log.info("Найдено {} активных вилок", result.size());
+        return result;
     }
 }

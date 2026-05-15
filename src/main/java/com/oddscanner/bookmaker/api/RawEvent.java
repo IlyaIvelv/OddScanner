@@ -3,6 +3,7 @@
 package com.oddscanner.bookmaker.api;
 
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -14,6 +15,7 @@ import java.util.List;
  * Содержит информацию до нормализации.
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
 public class RawEvent {
@@ -22,7 +24,8 @@ public class RawEvent {
     private String awayTeamName; // Имя гостевой команды как есть
     private LocalDateTime startTime; // Время начала события
     private String leagueName; // Название лиги как есть
-    private String sportName; // Название вида спорта как есть
+    private String sportName;
+    private String eventUrl; // Название вида спорта как есть
     private List<RawMarket> markets; // Список рынков для этого события (может быть null или пустым при инициализации)
     // Дополнительные поля, если необходимы (статус, счет и т.д.)
 }

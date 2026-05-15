@@ -3,6 +3,7 @@
 package com.oddscanner.bookmaker.api;
 
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -13,6 +14,7 @@ import java.math.BigDecimal;
  * Например, "Домашняя победа", "Тотал больше 2.5", "Фора -1.5 на хозяев".
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
 public class RawOutcome {

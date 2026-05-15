@@ -7,6 +7,7 @@ import com.oddscanner.generated.tables.records.ArbLegsRecord;
 import com.oddscanner.repository.ArbLegRepository;
 import com.oddscanner.repository.ArbOpportunityRepository;
 import com.oddscanner.repository.OutcomeRepository; // Добавим, если нужно получить outcomeKey
+import com.oddscanner.scanner.ArbFinderService;
 import com.oddscanner.scanner.dto.ArbitrageOpportunityResponseDTO; // Используем правильный пакет
 import com.oddscanner.scanner.dto.ArbLegResponseDTO; // Используем правильный пакет
 import io.swagger.v3.oas.annotations.Operation;
@@ -17,12 +18,14 @@ import io.swagger.v3.oas.annotations.responses.ApiResponse;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
@@ -36,6 +39,9 @@ public class ArbController {
     private final ArbOpportunityRepository arbOpportunityRepo;
     private final ArbLegRepository arbLegRepo;
     private final OutcomeRepository outcomeRepo; // Добавим репозиторий для получения outcomeKey
+
+    @Autowired
+    private ArbFinderService arbFinderService;
 
     public ArbController(ArbOpportunityRepository arbOpportunityRepo,
                          ArbLegRepository arbLegRepo,
@@ -141,5 +147,10 @@ public class ArbController {
 
         dto.setLegs(legDtos);
         return dto;
+    }
+
+    @GetMapping("/api/v1/arbs/details")
+    public ResponseEntity<List<Map<String, Object>>> getArbsWithDetails() {
+        return ResponseEntity.ok(arbFinderService.getArbsWithDetails());
     }
 }

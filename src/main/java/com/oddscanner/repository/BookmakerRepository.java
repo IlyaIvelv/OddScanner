@@ -8,5 +8,6 @@ public interface BookmakerRepository {
     List<BookmakersRecord> findAllEnabled();
     Optional<BookmakersRecord> findByCode(String code);
     Optional<BookmakersRecord> findById(Long id);
+    List<BookmakersRecord> findAllBookmakers();
     BookmakersRecord save(BookmakersRecord record);
 }

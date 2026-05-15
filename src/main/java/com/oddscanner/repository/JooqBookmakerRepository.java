@@ -60,4 +60,13 @@ public class JooqBookmakerRepository implements BookmakerRepository {
                     .into(BookmakersRecord.class);
         }
     }
+
+    @Override
+    public List<BookmakersRecord> findAllBookmakers() {
+        return dsl.selectFrom(Tables.BOOKMAKERS)
+                .fetch()
+                .into(BookmakersRecord.class);
+    }
+
+
 }

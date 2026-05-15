@@ -1,218 +1,269 @@
 package com.oddscanner.bookmaker.fonbet;
 
+import com.microsoft.playwright.Page;
+import com.microsoft.playwright.ElementHandle;
+import com.microsoft.playwright.options.LoadState;
 import com.oddscanner.bookmaker.api.BookmakerAdapter;
 import com.oddscanner.bookmaker.api.RawEvent;
 import com.oddscanner.bookmaker.api.RawMarket;
 import com.oddscanner.bookmaker.api.RawOutcome;
-import com.microsoft.playwright.*;
-import com.microsoft.playwright.options.LoadState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import java.util.*;
 
 @Component
 public class FonbetAdapter implements BookmakerAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(FonbetAdapter.class);
-    // ИСПРАВЛЕННЫЙ URL
-    private static final String BASE_URL = "https://fon.bet/sports/football";
-    private static final Pattern EVENT_ID_PATTERN = Pattern.compile("/event/(\\d+)");
+    private static final String BOOKMAKER_NAME = "fonbet";
+    private static final String URL_LIVE = "https://fon.bet/live/football";
+
+    // CSS селекторы с использованием частичного совпадения (динамические классы)
+    private static final String EVENT_CONTAINER_SELECTOR = "[class*='sport-base-event-wrap']";
+    private static final String EVENT_MAIN_SELECTOR = "[class*='sport-base-event--']";
+    private static final String TEAM_NAME_SELECTOR = "[class*='sport-base-event__main__caption__rendertron']";
+    private static final String SCORE_SELECTOR = "[class*='event-block-score--']";
+    private static final String TIME_SELECTOR = "[class*='event-block-current-time__time--']";
+    private static final String FACTOR_CONTAINER_SELECTOR = "[class*='factor-value--']";
+    private static final String FACTOR_VALUE_SELECTOR = "[class*='value--']";
+    private static final String FACTOR_PARAM_SELECTOR = "[class*='param--']";
 
     @Override
     public String code() {
-        return "fonbet";
+        return BOOKMAKER_NAME;
     }
 
     @Override
     public List<RawEvent> fetchEvents() {
-        log.info("=== НАЧАЛО ПАРСИНГА FONBET ===");
-        log.info("Fetching events from {} using Playwright", code());
+        log.info("Starting to fetch events from Fonbet");
 
-        List<RawEvent> events = new ArrayList<>();
+        Page page = null;
+        com.microsoft.playwright.Playwright playwright = null;
+        com.microsoft.playwright.Browser browser = null;
 
-        try (Playwright playwright = Playwright.create()) {
-            Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                    .setHeadless(true)  // Можно поставить false для отладки
-                    .setSlowMo(100)
-                    .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
+        try {
+            playwright = com.microsoft.playwright.Playwright.create();
+            browser = playwright.chromium().launch(
+                    new com.microsoft.playwright.BrowserType.LaunchOptions().setHeadless(false) // Для отладки лучше false
+            );
+            page = browser.newPage();
 
-            BrowserContext context = browser.newContext(new Browser.NewContextOptions()
-                    .setViewportSize(1920, 1080)
-                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
-
-            Page page = context.newPage();
-
-            log.info("Navigating to {}", BASE_URL);
-            page.navigate(BASE_URL);
-            // Ждём, пока пройдут основные сетевые запросы
+            page.navigate(URL_LIVE);
             page.waitForLoadState(LoadState.NETWORKIDLE);
-            // Дополнительная задержка для подгрузки динамического контента
-            page.waitForTimeout(5000);
+            Thread.sleep(5000); // Даем время для полной загрузки динамического контента
 
-            // --- УНИВЕРСАЛЬНЫЕ СЕЛЕКТОРЫ ДЛЯ ПОИСКА СОБЫТИЙ ---
-            // Ищем блоки, которые могут содержать название команды
-            List<ElementHandle> possibleBlocks = page.querySelectorAll(".team-name, .member-name, .event-cell, .live-event-item, a[href*='/event/']");
+            savePageSource(page);
 
-            log.info("Found {} potential event elements on Fonbet", possibleBlocks.size());
+            // Ждем появления событий
+            page.waitForSelector(EVENT_CONTAINER_SELECTOR, new Page.WaitForSelectorOptions().setTimeout(30000));
 
-            for (ElementHandle block : possibleBlocks) {
+            List<ElementHandle> eventContainers = page.querySelectorAll(EVENT_CONTAINER_SELECTOR);
+            log.info("Found {} event containers", eventContainers.size());
+
+            List<RawEvent> events = new ArrayList<>();
+
+            for (ElementHandle container : eventContainers) {
                 try {
-                    String text = block.textContent().trim();
-                    if (text == null || text.isEmpty() || text.length() < 5) continue;
-
-                    String homeTeam = "Unknown";
-                    String awayTeam = "TBD";
-
-                    // Пробуем извлечь команды из текста
-                    if (text.contains(" - ")) {
-                        String[] parts = text.split(" - ");
-                        if (parts.length >= 2) {
-                            homeTeam = parts[0].trim();
-                            awayTeam = parts[1].trim();
-                        }
-                    } else if (text.contains(" vs ")) {
-                        String[] parts = text.split(" vs ");
-                        if (parts.length >= 2) {
-                            homeTeam = parts[0].trim();
-                            awayTeam = parts[1].trim();
-                        }
+                    RawEvent event = parseEvent(container);
+                    if (event != null && event.getMarkets() != null && !event.getMarkets().isEmpty()) {
+                        events.add(event);
+                        log.info("✓ Parsed: {} | Score: {}:{}",
+                                event.getName(), event.getHomeScore(), event.getAwayScore());
                     }
-
-                    // Пробуем найти ID события из href
-                    String externalId = "unknown";
-                    String href = block.getAttribute("href");
-                    if (href != null && href.contains("/event/")) {
-                        Matcher m = EVENT_ID_PATTERN.matcher(href);
-                        if (m.find()) {
-                            externalId = m.group(1);
-                        }
-                    } else {
-                        // Если у текущего блока нет href, ищем ссылку внутри или родителя
-                        ElementHandle link = block.querySelector("a[href*='/event/']");
-                        if (link == null) {
-                            link = block.querySelector("xpath=ancestor::a[contains(@href, '/event/')]");
-                        }
-                        if (link != null) {
-                            String linkHref = link.getAttribute("href");
-                            if (linkHref != null) {
-                                Matcher m = EVENT_ID_PATTERN.matcher(linkHref);
-                                if (m.find()) {
-                                    externalId = m.group(1);
-                                }
-                            }
-                        }
-                    }
-
-                    // Если ID так и не нашли или команды не распарсились, пропускаем это событие
-                    if ("unknown".equals(externalId) || "Unknown".equals(homeTeam) || "TBD".equals(awayTeam)) {
-                        log.debug("Skipping event with insufficient data: ID={}, home={}, away={}", externalId, homeTeam, awayTeam);
-                        continue;
-                    }
-
-                    RawEvent event = new RawEvent(
-                            externalId,
-                            homeTeam,
-                            awayTeam,
-                            LocalDateTime.now().plusHours(2),
-                            "Football",
-                            null,
-                            new ArrayList<>()
-                    );
-                    events.add(event);
-                    log.debug("Parsed Fonbet event: {} vs {} (ID: {})", homeTeam, awayTeam, externalId);
-
                 } catch (Exception e) {
-                    log.debug("Error parsing Fonbet event block: {}", e.getMessage());
+                    log.warn("Failed to parse event: {}", e.getMessage());
                 }
             }
 
-            //browser.close();
-        } catch (Exception e) {
-            log.error("Error fetching events from {}", code(), e);
-        }
+            log.info("Successfully parsed {} events from Fonbet", events.size());
+            return events;
 
-        log.info("=== FONBET: Found {} events ===", events.size());
-        return events;
+        } catch (Exception e) {
+            log.error("Failed to fetch events from Fonbet", e);
+            return Collections.emptyList();
+        } finally {
+            if (page != null && !page.isClosed()) page.close();
+            if (browser != null) browser.close();
+            if (playwright != null) playwright.close();
+        }
     }
 
     @Override
-    public List<RawMarket> fetchMarkets(String externalEventId) {
-        log.info("Fetching markets for Fonbet event {}", externalEventId);
+    public List<RawMarket> fetchMarkets(String eventId) {
+        return Collections.emptyList();
+    }
 
-        List<RawMarket> markets = new ArrayList<>();
-
-        if ("unknown".equals(externalEventId)) {
-            log.warn("Skipping markets fetch for Fonbet event with unknown ID");
-            return markets;
+    private RawEvent parseEvent(ElementHandle container) {
+        // Ищем основной блок события
+        ElementHandle mainBlock = container.querySelector(EVENT_MAIN_SELECTOR);
+        if (mainBlock == null) {
+            log.debug("Main block not found");
+            return null;
         }
 
-        try (Playwright playwright = Playwright.create()) {
-            Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                    .setHeadless(false)
-                    .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
+        // Извлекаем название матча
+        ElementHandle teamNameElement = mainBlock.querySelector(TEAM_NAME_SELECTOR);
+        if (teamNameElement == null) {
+            log.debug("Team name element not found");
+            return null;
+        }
 
-            BrowserContext context = browser.newContext(new Browser.NewContextOptions()
-                    .setViewportSize(1920, 1080)
-                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
+        String matchName = teamNameElement.textContent().trim();
+        if (matchName.isEmpty()) return null;
 
-            Page page = context.newPage();
+        String[] teams = splitTeams(matchName);
+        String homeTeam = teams[0];
+        String awayTeam = teams[1];
 
-            // Используем актуальную структуру URL Фонбета для страницы события
-            String eventUrl = "https://fon.bet/event/" + externalEventId;
-            log.info("Navigating to Fonbet event page: {}", eventUrl);
-            page.navigate(eventUrl);
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            page.waitForTimeout(3000);
+        // Извлекаем счет
+        String scoreText = "0:0";
+        ElementHandle scoreElement = mainBlock.querySelector(SCORE_SELECTOR);
+        if (scoreElement != null && scoreElement.textContent() != null) {
+            scoreText = scoreElement.textContent().trim();
+        }
+        int[] scores = parseScore(scoreText);
 
-            // Универсальный поиск коэффициентов
-            List<RawOutcome> mainOutcomes = new ArrayList<>();
-            List<ElementHandle> outcomes = page.querySelectorAll(".coefficient, .odd, [class*='coef'], .price, .bet-item-odds");
+        // Извлекаем время
+        String time = "";
+        ElementHandle timeElement = mainBlock.querySelector(TIME_SELECTOR);
+        if (timeElement != null && timeElement.textContent() != null) {
+            time = timeElement.textContent().trim();
+        }
 
-            for (ElementHandle outcome : outcomes) {
-                try {
-                    String oddsText = outcome.textContent().trim();
-                    if (oddsText == null || oddsText.isEmpty()) continue;
+        // Извлекаем коэффициенты
+        List<RawMarket> markets = extractMarkets(mainBlock);
 
-                    oddsText = oddsText.replace(",", ".");
-                    BigDecimal odds = new BigDecimal(oddsText);
+        if (markets.isEmpty()) return null;
 
-                    mainOutcomes.add(new RawOutcome(
-                            "OUTCOME_" + mainOutcomes.size(),
-                            "value_" + mainOutcomes.size(),
-                            oddsText,
-                            odds,
-                            true
-                    ));
-                } catch (Exception e) {
-                    log.debug("Error parsing Fonbet outcome: {}", e.getMessage());
-                }
+        RawEvent event = new RawEvent();
+        event.setBookmakerId(BOOKMAKER_NAME);
+        event.setName(matchName);
+        event.setHomeTeam(homeTeam);
+        event.setAwayTeam(awayTeam);
+        event.setHomeScore(scores[0]);
+        event.setAwayScore(scores[1]);
+        event.setEventTime(time);
+        event.setMarkets(markets);
+        event.setUpdatedAt(LocalDateTime.now());
+
+        return event;
+    }
+
+    private List<RawMarket> extractMarkets(ElementHandle mainBlock) {
+        List<RawMarket> markets = new ArrayList<>();
+
+        // Находим все блоки с коэффициентами
+        List<ElementHandle> factorBlocks = mainBlock.querySelectorAll(FACTOR_CONTAINER_SELECTOR);
+        log.debug("Found {} factor blocks", factorBlocks.size());
+
+        if (factorBlocks.isEmpty()) return markets;
+
+        // Рынок исходов (первые 3 коэффициента - это 1, X, 2)
+        RawMarket matchWinnerMarket = new RawMarket();
+        matchWinnerMarket.setType("MATCH_WINNER");
+        matchWinnerMarket.setId(UUID.randomUUID().toString());
+
+        List<RawOutcome> outcomes = new ArrayList<>();
+        String[] selectionNames = {"1", "X", "2"};
+
+        for (int i = 0; i < Math.min(3, factorBlocks.size()); i++) {
+            ElementHandle factorBlock = factorBlocks.get(i);
+            RawOutcome outcome = parseOutcome(factorBlock);
+
+            if (outcome != null && outcome.getValue() > 0) {
+                outcome.setName(selectionNames[i]);
+                outcome.setId(UUID.randomUUID().toString());
+                outcomes.add(outcome);
+                log.debug("  Outcome {}: {}", selectionNames[i], outcome.getValue());
             }
+        }
 
-            if (!mainOutcomes.isEmpty()) {
-                markets.add(new RawMarket(
-                        "MAIN",
-                        "FULL_TIME",
-                        null,
-                        externalEventId,
-                        externalEventId,
-                        null,
-                        mainOutcomes
-                ));
-                log.info("Found {} outcomes for Fonbet event {}", mainOutcomes.size(), externalEventId);
-            }
-
-            //browser.close();
-        } catch (Exception e) {
-            log.error("Error fetching markets for Fonbet event {}", externalEventId, e);
+        if (!outcomes.isEmpty()) {
+            matchWinnerMarket.setOutcomes(outcomes);
+            markets.add(matchWinnerMarket);
         }
 
         return markets;
+    }
+
+    private RawOutcome parseOutcome(ElementHandle factorBlock) {
+        try {
+            ElementHandle valueElement = factorBlock.querySelector(FACTOR_VALUE_SELECTOR);
+            if (valueElement == null) {
+                // Пробуем альтернативный селектор внутри блока
+                valueElement = factorBlock.querySelector("[class*='value']");
+                if (valueElement == null) return null;
+            }
+
+            String valueStr = valueElement.textContent().trim();
+            log.debug("  Raw value string: '{}'", valueStr);
+
+            if (valueStr.equals("-") || valueStr.isEmpty()) return null;
+
+            // Очищаем от лишних символов и пробелов
+            valueStr = valueStr.replaceAll("[^\\d.]", "");
+            if (valueStr.isEmpty()) return null;
+
+            double oddValue;
+            try {
+                oddValue = Double.parseDouble(valueStr);
+            } catch (NumberFormatException e) {
+                log.debug("Failed to parse value: {}", valueStr);
+                return null;
+            }
+
+            if (oddValue <= 0) return null;
+
+            RawOutcome outcome = new RawOutcome();
+            outcome.setValue(oddValue);
+
+            return outcome;
+        } catch (Exception e) {
+            log.debug("Error parsing outcome: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private String[] splitTeams(String matchName) {
+        String[] parts = matchName.split(" - ");
+        if (parts.length == 2) {
+            return new String[]{parts[0].trim(), parts[1].trim()};
+        }
+        // Если разделитель другой (например, " vs ")
+        parts = matchName.split(" vs ");
+        if (parts.length == 2) {
+            return new String[]{parts[0].trim(), parts[1].trim()};
+        }
+        return new String[]{matchName, ""};
+    }
+
+    private int[] parseScore(String scoreText) {
+        if (scoreText == null || scoreText.isEmpty()) return new int[]{0, 0};
+        // Очищаем от возможных комментариев в скобках (например, "0:0 (0-0)")
+        scoreText = scoreText.split("\\(")[0].trim();
+        String[] parts = scoreText.split(":");
+        if (parts.length != 2) return new int[]{0, 0};
+        try {
+            return new int[]{Integer.parseInt(parts[0].trim()), Integer.parseInt(parts[1].trim())};
+        } catch (NumberFormatException e) {
+            return new int[]{0, 0};
+        }
+    }
+
+    private void savePageSource(Page page) {
+        try {
+            String content = page.content();
+            Path path = Paths.get("fonbet_debug.html");
+            Files.writeString(path, content);
+            log.info("Saved page source to {}", path.toAbsolutePath());
+        } catch (Exception e) {
+            log.warn("Failed to save page source: {}", e.getMessage());
+        }
     }
 }

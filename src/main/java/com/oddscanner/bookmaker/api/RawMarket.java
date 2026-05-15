@@ -3,6 +3,7 @@
 package com.oddscanner.bookmaker.api;
 
 import lombok.AllArgsConstructor;
+import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 
@@ -14,6 +15,7 @@ import java.util.List;
  * Например, "Тотал голов", "Фора", "Индивидуальный тотал".
  */
 @Data
+@Builder
 @NoArgsConstructor
 @AllArgsConstructor
 public class RawMarket {

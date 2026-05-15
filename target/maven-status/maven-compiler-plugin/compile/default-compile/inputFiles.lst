@@ -4,7 +4,10 @@ C:\Projects\OddScanner\src\main\java\com\oddscanner\bookmaker\api\RawMarket.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\bookmaker\api\RawOutcome.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\bookmaker\fonbet\FonbetAdapter.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\bookmaker\marathon\MarathonAdapter.java
+C:\Projects\OddScanner\src\main\java\com\oddscanner\bookmaker\service\EventMatchingService.java
+C:\Projects\OddScanner\src\main\java\com\oddscanner\bookmaker\thesportsdb\TheSportsDbAdapter.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\config\BookmakerProperties.java
+C:\Projects\OddScanner\src\main\java\com\oddscanner\config\JacksonConfig.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\config\JooqConfig.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\controller\ArbController.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\generated\DefaultCatalog.java
@@ -106,4 +109,5 @@ C:\Projects\OddScanner\src\main\java\com\oddscanner\scanner\dto\ArbitrageOpportu
 C:\Projects\OddScanner\src\main\java\com\oddscanner\scanner\dto\ArbitrageOpportunityResponseDTO.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\scanner\dto\ArbLegDTO.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\scanner\dto\ArbLegResponseDTO.java
+C:\Projects\OddScanner\src\main\java\com\oddscanner\scanner\EventMatcherService.java
 C:\Projects\OddScanner\src\main\java\com\oddscanner\scheduler\ScannerTriggerService.java

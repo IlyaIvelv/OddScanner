@@ -25,19 +25,17 @@ public class OddScannerApplication {
         SpringApplication.run(OddScannerApplication.class, args);
     }
 
-    @Bean
-    public CommandLineRunner demoRunner(JooqBookmakerRepository bookmakerRepo) {
-        return args -> {
-            System.out.println("--- Запуск тестового запроса через JooqBookmakerRepository ---");
-            List<BookmakersRecord> results = bookmakerRepo.findAllEnabled(); // Изменили вызов
-            System.out.println("Найдено " + results.size() + " активных букмекеров:");
-            for (BookmakersRecord record : results) { // Изменили итерацию
-                // record.getId(), record.getCode(), record.getName()
-                System.out.println("- ID: " + record.getId() + ", Code: " + record.getCode() + ", Name: " + record.getName());
-            }
-            System.out.println("--- Завершено ---");
-        };
-    }
+//    @Bean
+//    public CommandLineRunner demoRunner(JooqBookmakerRepository bookmakerRepo, IngestionService ingestionService) {
+//        return args -> {
+//            System.out.println("--- Статус букмекеров ---");
+//
+//            // Выводим статус через IngestionService
+//            ingestionService.printBookmakersStatus();
+//
+//            System.out.println("--- Завершено ---");
+//        };
+//    }
 
 
     // Добавим CommandLineRunner для запуска инжестии при старте
@@ -47,6 +45,13 @@ public class OddScannerApplication {
             log.info("--- Запуск тестовой инжестии при старте приложения ---");
 
 
+            try {
+                log.info("=== НАЧАЛО ЗАГРУЗКИ FONBET ===");
+                ingestionService.ingest("fonbet");
+                log.info("=== ЗАГРУЗКА FONBET ЗАВЕРШЕНА ===");
+            } catch (Exception e) {
+                log.error("Ошибка при инжестии Fonbet: ", e);
+            }
 
             try {
                 log.info("=== НАЧАЛО ЗАГРУЗКИ MARATHON ===");
@@ -56,22 +61,14 @@ public class OddScannerApplication {
                 log.error("Ошибка при инжестии Marathon: ", e);
             }
 
-//
-//            try {
-//                log.info("=== НАЧАЛО ЗАГРУЗКИ FONBET ===");
-//                ingestionService.ingest("fonbet");
-//                log.info("=== ЗАГРУЗКА FONBET ЗАВЕРШЕНА ===");
-//            } catch (Exception e) {
-//                log.error("Ошибка при инжестии Fonbet: ", e);
-//            }
-//
-//            try {
-//                log.info("=== НАЧАЛО ЗАГРУЗКИ THESPORTSDB ===");
-//                ingestionService.ingest("thesportsdb");
-//                log.info("=== ЗАГРУЗКА THESPORTSDB ЗАВЕРШЕНА ===");
-//            } catch (Exception e) {
-//                log.error("Ошибка при инжестии TheSportsDB: ", e);
-//            }
+
+            try {
+                log.info("=== НАЧАЛО ЗАГРУЗКИ THESPORTSDB ===");
+                ingestionService.ingest("thesportsdb");
+                log.info("=== ЗАГРУЗКА THESPORTSDB ЗАВЕРШЕНА ===");
+            } catch (Exception e) {
+                log.error("Ошибка при инжестии TheSportsDB: ", e);
+            }
 
             log.info("--- ЗАВЕРШЕНО ---");
         };

@@ -7,7 +7,7 @@
     <parent>
         <groupId>org.springframework.boot</groupId>
         <artifactId>spring-boot-starter-parent</artifactId>
-        <version>3.5.0</version> <!-- Используем актуальную версию из твоего стека -->
+        <version>3.5.0</version>
         <relativePath/>
     </parent>
 
@@ -24,7 +24,38 @@
         <commons-text.version>1.12.0</commons-text.version>
         <springdoc.version>2.5.0</springdoc.version>
         <argLine>-Dfile.encoding=UTF-8</argLine>
+        <skip.jooq.generation>true</skip.jooq.generation>
     </properties>
+
+    <profiles>
+        <profile>
+            <id>generate-jooq</id>
+            <activation>
+                <property>
+                    <name>generateJooq</name>
+                    <value>true</value>
+                </property>
+            </activation>
+            <build>
+                <plugins>
+                    <plugin>
+                        <groupId>org.jooq</groupId>
+                        <artifactId>jooq-codegen-maven</artifactId>
+                        <version>3.19.8</version>
+                        <executions>
+                            <execution>
+                                <id>generate-jooq-sources</id>
+                                <phase>generate-sources</phase>
+                                <goals>
+                                    <goal>generate</goal>
+                                </goals>
+                            </execution>
+                        </executions>
+                    </plugin>
+                </plugins>
+            </build>
+        </profile>
+    </profiles>
 
     <dependencies>
         <!-- Spring Boot Starters -->
@@ -36,7 +67,6 @@
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
-        <!-- Вместо JPA используем JOOQ -->
         <dependency>
             <groupId>org.jooq</groupId>
             <artifactId>jooq</artifactId>
@@ -66,7 +96,7 @@
             <artifactId>commons-text</artifactId>
             <version>${commons-text.version}</version>
         </dependency>
-        
+
         <!-- Playwright for Parsing -->
         <dependency>
             <groupId>com.microsoft.playwright</groupId>
@@ -80,7 +110,12 @@
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>${springdoc.version}</version>
         </dependency>
-
+        <dependency>
+            <groupId>org.jsoup</groupId>
+            <artifactId>jsoup</artifactId>
+            <version>1.18.1</version>
+        </dependency>
+        
         <!-- Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -113,7 +148,6 @@
                     </excludes>
                 </configuration>
             </plugin>
-            <!-- JOOQ Codegen Plugin will be added later after DB init -->
             <plugin>
                 <groupId>org.jooq</groupId>
                 <artifactId>jooq-codegen-maven</artifactId>
@@ -128,9 +162,7 @@
                     </execution>
                 </executions>
                 <configuration>
-                    <!-- ДОБАВЬ ЭТУ СТРОКУ -->
                     <onError>SILENT</onError>
-
                     <jdbc>
                         <driver>org.postgresql.Driver</driver>
                         <url>jdbc:postgresql://localhost:5433/oddscanner</url>
@@ -154,4 +186,33 @@
             </plugin>
         </plugins>
     </build>
+
+    <!-- ПЕРЕОПРЕДЕЛЯЕМ РЕПОЗИТОРИИ ЧТОБЫ Maven Central БЫЛ ПЕРВЫМ -->
+    <repositories>
+        <repository>
+            <id>central</id>
+            <name>Maven Central</name>
+            <url>https://repo.maven.apache.org/maven2</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </repository>
+    </repositories>
+
+    <pluginRepositories>
+        <pluginRepository>
+            <id>central</id>
+            <name>Maven Central</name>
+            <url>https://repo.maven.apache.org/maven2</url>
+            <releases>
+                <enabled>true</enabled>
+            </releases>
+            <snapshots>
+                <enabled>false</enabled>
+            </snapshots>
+        </pluginRepository>
+    </pluginRepositories>
 </project>
