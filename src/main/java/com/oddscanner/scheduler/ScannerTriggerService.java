@@ -30,8 +30,9 @@ public class ScannerTriggerService {
     @Scheduled(fixedDelay = 30000) // Запускать каждые 30 секунд после завершения предыдущего выполнения
     // @Scheduled(cron = "0 0/1 * * * ?") // Альтернатива: запускать каждую минуту (cron выражение)
     public void triggerScheduledScan() {
-        log.info("Scheduled scan triggered.");
-        arbFinderService.triggerScan(); // Вызываем метод в ArbFinderService, который запускает сканирование
+        //TODO разкоментировать потом
+//        log.info("Scheduled scan triggered.");
+//        arbFinderService.triggerScan(); // Вызываем метод в ArbFinderService, который запускает сканирование
     }
 
     /**

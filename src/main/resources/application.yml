@@ -21,16 +21,20 @@ oddscanner:
     global-seconds: 30
   bookmakers:
     fonbet:
-      enabled: true
+      enabled: false
       base-url: https://www.fon.bet
       refresh-seconds: 30
     marathon:
       enabled: true
-      base-url: https://www.marathonbet.com
+      base-url: https://www.marathonbet.ru
+      refresh-seconds: 60
+    thesportsdb:
+      enabled: false
+      base-url: https://www.thesportsdb.com
       refresh-seconds: 60
   scanner:
-    trigger-mode: HYBRID # AFTER_INGEST | SCHEDULED | HYBRID
-    cron: "*/30 * * * * *"
+    trigger-mode: SCHEDULED # AFTER_INGEST | SCHEDULED | HYBRID
+    cron: "* * */1 * * *"
     debounce-ms: 1500
     min-profit-pct: 0.5
   normalization:

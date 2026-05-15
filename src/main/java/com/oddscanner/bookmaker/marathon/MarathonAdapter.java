@@ -1,25 +1,37 @@
-// File: src/main/java/com/oddscanner/bookmaker/marathon/MarathonAdapter.java
 package com.oddscanner.bookmaker.marathon;
+
 import com.oddscanner.bookmaker.api.BookmakerAdapter;
 import com.oddscanner.bookmaker.api.RawEvent;
 import com.oddscanner.bookmaker.api.RawMarket;
 import com.oddscanner.bookmaker.api.RawOutcome;
+import com.oddscanner.generated.Tables;
+import com.oddscanner.generated.tables.records.EventsRecord;
 import com.microsoft.playwright.*;
+import com.microsoft.playwright.options.LoadState;
+import com.oddscanner.generated.tables.records.LeaguesRecord;
+import com.oddscanner.generated.tables.records.TeamsRecord;
+import org.jooq.DSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
-import java.math.BigDecimal;
+
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
+import java.time.ZoneOffset;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Component
 public class MarathonAdapter implements BookmakerAdapter {
     private static final Logger log = LoggerFactory.getLogger(MarathonAdapter.class);
-    private static final String BASE_URL = "https://www.marathonbet.ru/su/betting/Football";
+    private static final String BASE_URL = "https://www.marathonbet.ru";
     private static final Pattern EVENT_ID_PATTERN = Pattern.compile("/event/(\\d+)");
+
+    private final DSLContext dsl;
+
+    public MarathonAdapter(DSLContext dsl) {
+        this.dsl = dsl;
+    }
 
     @Override
     public String code() {
@@ -28,175 +40,213 @@ public class MarathonAdapter implements BookmakerAdapter {
 
     @Override
     public List<RawEvent> fetchEvents() {
-        log.info("Fetching events from {} using Playwright", code());
+        log.info("=== НАЧАЛО ПАРСИНГА MARATHON ===");
 
-        List<RawEvent> events = new ArrayList<>();
+        // Список лиг для парсинга (только футбол)
+        List<String> leagueUrls = Arrays.asList(
+                "/su/betting/Football/Spain/Primera+Division+-+8736?interval=ALL_TIME",
+                "/su/betting/Football/England/Premier+League+-+21520?interval=ALL_TIME",
+                "/su/betting/Football/Russia/Premier+League+-+22433?interval=ALL_TIME"
+        );
+
+        int totalSaved = 0;
+
+        for (String leagueUrl : leagueUrls) {
+            try {
+                log.info("Парсинг лиги: {}", leagueUrl);
+                int saved = parseAndSaveLeague(leagueUrl);
+                totalSaved += saved;
+                log.info("Сохранено {} событий из лиги", saved);
+                Thread.sleep(2000);
+            } catch (Exception e) {
+                log.error("Ошибка парсинга лиги {}: {}", leagueUrl, e.getMessage());
+            }
+        }
+
+        log.info("=== MARATHON: Всего сохранено {} событий ===", totalSaved);
+        return new ArrayList<>();
+    }
+
+
+    private int parseAndSaveLeague(String leagueUrl) {
+        int savedCount = 0;
+
         try (Playwright playwright = Playwright.create()) {
             Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                    .setHeadless(true)
+                    .setHeadless(false)
+                    .setSlowMo(300)
                     .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
 
-            BrowserContext context = browser.newContext(new Browser.NewContextOptions()
-                    .setViewportSize(1920, 1080)
-                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
+            Page page = browser.newPage();
+            page.navigate(BASE_URL + leagueUrl);
+            page.waitForLoadState(LoadState.NETWORKIDLE);
+            page.waitForTimeout(5000);
 
-            Page page = context.newPage();
+            log.info("=== СТРАНИЦА ЗАГРУЖЕНА ===");
 
-            // Увеличиваем таймаут и добавляем ожидание загрузки контента
-            page.navigate(BASE_URL, new Page.NavigateOptions().setTimeout(60000));
-            page.waitForSelector("tr[data-event-id]", new Page.WaitForSelectorOptions().setTimeout(30000));
+            // Ищем элементы с data-event-id
+            List<ElementHandle> eventElements = page.querySelectorAll("[data-event-id]");
+            log.info("Найдено [data-event-id]: {}", eventElements.size());
 
-            // Извлекаем все события
-            List<ElementHandle> eventRows = page.querySelectorAll("tr[data-event-id]");
+            if (eventElements.isEmpty()) {
+                // Ищем элементы с data-id
+                eventElements = page.querySelectorAll("[data-id]");
+                log.info("Найдено [data-id]: {}", eventElements.size());
+            }
 
-            for (ElementHandle eventRow : eventRows) {
+            if (eventElements.isEmpty()) {
+                // Ищем элементы с классом event
+                eventElements = page.querySelectorAll("[class*='event']");
+                log.info("Найдено [class*='event']: {}", eventElements.size());
+            }
+
+            if (eventElements.isEmpty()) {
+                log.warn("НЕ НАЙДЕНО ЭЛЕМЕНТОВ СОБЫТИЙ!");
+                browser.close();
+                return 0;
+            }
+
+            for (ElementHandle element : eventElements) {
                 try {
-                    // Извлекаем данные о событии
-                    String homeTeam = eventRow.querySelector("td:nth-child(2)").textContent().trim();
-                    String awayTeam = eventRow.querySelector("td:nth-child(3)").textContent().trim();
-                    String externalId = eventRow.getAttribute("data-event-id");
+                    String externalId = element.getAttribute("data-event-id");
+                    if (externalId == null) {
+                        externalId = element.getAttribute("data-id");
+                    }
+                    if (externalId == null) {
+                        externalId = "unknown";
+                    }
 
-                    // Парсим время матча
-                    String timeText = eventRow.querySelector("td:nth-child(4)").textContent().trim();
-                    LocalDateTime startTime = parseMatchTime(timeText);
+                    String text = element.textContent().trim();
+                    log.info("Текст элемента: {}", text.substring(0, Math.min(200, text.length())));
 
-                    // Создаем RawEvent с правильным количеством параметров
-                    RawEvent event = new RawEvent(
-                            externalId,
-                            homeTeam,
-                            awayTeam,
-                            startTime,
-                            "Football",  // sportName
-                            null,        // leagueName
-                            new ArrayList<>() // markets
-                    );
+                    String homeTeam = "Unknown";
+                    String awayTeam = "TBD";
 
-                    events.add(event);
-                    log.debug("Parsed event: {} vs {} (ID: {})", homeTeam, awayTeam, externalId);
+                    // Ищем .member-name внутри элемента
+                    List<ElementHandle> members = element.querySelectorAll(".member-name");
+                    if (members.size() >= 2) {
+                        homeTeam = members.get(0).textContent().trim();
+                        awayTeam = members.get(1).textContent().trim();
+                    }
+
+                    // Если не нашли, пробуем через сплит
+                    if ("Unknown".equals(homeTeam) && text.contains(" - ")) {
+                        String[] parts = text.split(" - ");
+                        if (parts.length >= 2) {
+                            homeTeam = parts[0].trim();
+                            awayTeam = parts[1].trim();
+                        }
+                    }
+
+                    if ("Unknown".equals(homeTeam)) {
+                        // Пробуем найти команды через регулярное выражение
+                        String[] words = text.split("\\s+");
+                        for (int i = 0; i < words.length - 1; i++) {
+                            if (words[i].length() > 2 && words[i].matches("[А-Яа-яA-Za-z]+")) {
+                                homeTeam = words[i];
+                                for (int j = i + 1; j < words.length; j++) {
+                                    if (words[j].length() > 2 && words[j].matches("[А-Яа-яA-Za-z]+")) {
+                                        awayTeam = words[j];
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    log.info("Команды: {} vs {}, ID: {}", homeTeam, awayTeam, externalId);
+
+                    if ("Unknown".equals(homeTeam) || "TBD".equals(awayTeam)) {
+                        log.warn("Не удалось определить команды");
+                        continue;
+                    }
+
+                    Long homeTeamId = findOrCreateTeam(homeTeam);
+                    Long awayTeamId = findOrCreateTeam(awayTeam);
+
+                    EventsRecord existing = dsl.selectFrom(Tables.EVENTS)
+                            .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
+                            .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
+                            .fetchOne();
+
+                    if (existing != null) {
+                        continue;
+                    }
+
+                    EventsRecord record = dsl.newRecord(Tables.EVENTS);
+                    record.setHomeTeamId(homeTeamId);
+                    record.setAwayTeamId(awayTeamId);
+                    record.setStartTime(LocalDateTime.now().plusHours(2).atOffset(ZoneOffset.UTC));
+                    record.setStatus("SCHEDULED");
+                    record.store();
+
+                    savedCount++;
+                    log.info("✅ СОХРАНЕНО! {} vs {}", homeTeam, awayTeam);
+
                 } catch (Exception e) {
-                    log.error("Error parsing event row", e);
+                    log.error("Ошибка: {}", e.getMessage());
                 }
             }
 
+            Thread.sleep(5000);
             browser.close();
         } catch (Exception e) {
-            log.error("Error fetching events from {}", code(), e);
+            log.error("Ошибка парсинга: {}", e.getMessage(), e);
         }
 
-        log.info("Found {} events from {}", events.size(), code());
-        return events;
+        log.info("=== СОХРАНЕНО {} СОБЫТИЙ ===", savedCount);
+        return savedCount;
+    }
+
+
+    private Long findOrCreateTeam(String teamName) {
+        if (teamName == null || teamName.isEmpty() || "Unknown".equals(teamName) || "TBD".equals(teamName)) {
+            return 1L; // ID команды "Unknown"
+        }
+
+        // Ищем существующую команду
+        TeamsRecord existing = dsl.selectFrom(Tables.TEAMS)
+                .where(Tables.TEAMS.CANONICAL_NAME.eq(teamName))
+                .fetchOne();
+
+        if (existing != null) {
+            return existing.getId();
+        }
+
+        // Создаём новую команду
+        TeamsRecord newTeam = dsl.newRecord(Tables.TEAMS);
+        newTeam.setCanonicalName(teamName);
+        newTeam.setNormalizedName(teamName.toLowerCase());
+        newTeam.setSportId(1L); // Football
+        newTeam.store();
+
+        log.debug("Создана новая команда: {} (ID: {})", teamName, newTeam.getId());
+        return newTeam.getId();
+    }
+
+    private Long findOrCreateLeague(String leagueUrl) {
+        // Упрощённо: извлекаем название лиги из URL
+        String leagueName = leagueUrl.split("/")[3]; // Пример: "Spain"
+
+        LeaguesRecord existing = dsl.selectFrom(Tables.LEAGUES)
+                .where(Tables.LEAGUES.NAME.eq(leagueName))
+                .fetchOne();
+
+        if (existing != null) {
+            return existing.getId();
+        }
+
+        LeaguesRecord newLeague = dsl.newRecord(Tables.LEAGUES);
+        newLeague.setName(leagueName);
+        newLeague.setSportId(1L);
+        newLeague.store();
+
+        return newLeague.getId();
     }
 
     @Override
     public List<RawMarket> fetchMarkets(String externalEventId) {
-        log.info("Fetching markets for event {} from {}", externalEventId, code());
-
-        List<RawMarket> markets = new ArrayList<>();
-        try (Playwright playwright = Playwright.create()) {
-            Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                    .setHeadless(true)
-                    .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
-
-            BrowserContext context = browser.newContext(new Browser.NewContextOptions()
-                    .setViewportSize(1920, 1080)
-                    .setUserAgent("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"));
-
-            Page page = context.newPage();
-
-            // Переходим на страницу конкретного события
-            String eventUrl = "https://www.marathonbet.ru/su/betting/event/" + externalEventId;
-            page.navigate(eventUrl, new Page.NavigateOptions().setTimeout(60000));
-            page.waitForSelector(".market-group", new Page.WaitForSelectorOptions().setTimeout(30000));
-
-            // Извлекаем основные рынки (П1, Х, П2)
-            List<RawOutcome> mainOutcomes = new ArrayList<>();
-            List<ElementHandle> mainMarketRows = page.querySelectorAll(".market-group:first-child .outcome-row");
-
-            for (ElementHandle row : mainMarketRows) {
-                String outcomeKey = row.querySelector(".outcome-name").textContent().trim();
-                String oddsText = row.querySelector(".outcome-coefficient").textContent().trim();
-                BigDecimal odds = new BigDecimal(oddsText.replace(",", "."));
-
-                // ИСПРАВЛЕНО: добавлен недостающий параметр outcomeValueDescription
-                mainOutcomes.add(new RawOutcome(
-                        outcomeKey,
-                        outcomeKey,  // Добавлен недостающий параметр
-                        outcomeKey,
-                        odds,
-                        true
-                ));
-            }
-
-            if (!mainOutcomes.isEmpty()) {
-                // Используем правильный конструктор с 7 параметрами
-                markets.add(new RawMarket(
-                        "MAIN",       // marketTypeName
-                        null,         // periodName
-                        null,         // line (как String)
-                        externalEventId, // externalId
-                        externalEventId, // sourceExternalId
-                        null,         // line (как BigDecimal)
-                        mainOutcomes  // outcomes
-                ));
-            }
-
-            // Извлекаем тоталы
-            List<ElementHandle> totalsRows = page.querySelectorAll(".market-group:has(.market-title:has-text('Тотал'))");
-            if (!totalsRows.isEmpty()) {
-                for (ElementHandle totalsGroup : totalsRows) {
-                    String lineText = totalsGroup.querySelector(".market-title").textContent().trim();
-                    Matcher matcher = Pattern.compile("Тотал (\\d+\\.?\\d*)").matcher(lineText);
-                    BigDecimal line = null;
-
-                    if (matcher.find()) {
-                        line = new BigDecimal(matcher.group(1));
-                    }
-
-                    List<RawOutcome> totalsOutcomes = new ArrayList<>();
-                    List<ElementHandle> outcomeRows = totalsGroup.querySelectorAll(".outcome-row");
-
-                    for (ElementHandle row : outcomeRows) {
-                        String outcomeKey = row.querySelector(".outcome-name").textContent().trim();
-                        String oddsText = row.querySelector(".outcome-coefficient").textContent().trim();
-                        BigDecimal odds = new BigDecimal(oddsText.replace(",", "."));
-
-                        // ИСПРАВЛЕНО: добавлен недостающий параметр outcomeValueDescription
-                        totalsOutcomes.add(new RawOutcome(
-                                outcomeKey.contains("Больше") ? "OVER" : "UNDER",
-                                outcomeKey,  // Добавлен недостающий параметр
-                                outcomeKey,
-                                odds,
-                                true
-                        ));
-                    }
-
-                    if (!totalsOutcomes.isEmpty()) {
-                        // Используем правильный конструктор с 7 параметрами
-                        markets.add(new RawMarket(
-                                "TOTAL",      // marketTypeName
-                                null,         // periodName
-                                line != null ? line.toString() : null, // line как String
-                                externalEventId, // externalId
-                                externalEventId, // sourceExternalId
-                                line,         // line как BigDecimal
-                                totalsOutcomes
-                        ));
-                    }
-                }
-            }
-
-            browser.close();
-        } catch (Exception e) {
-            log.error("Error fetching markets for event {} from {}", externalEventId, code(), e);
-        }
-
-        log.info("Found {} markets for event {}", markets.size(), externalEventId);
-        return markets;
-    }
-
-    private LocalDateTime parseMatchTime(String timeText) {
-        // Реализация парсинга времени матча
-        // Например, для формата "20:30" или "14 May 01:30"
-        return LocalDateTime.now().plusHours(2); // Заглушка
+        return new ArrayList<>();
     }
 }

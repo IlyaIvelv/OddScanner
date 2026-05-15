@@ -45,20 +45,35 @@ public class OddScannerApplication {
     public CommandLineRunner runAfterStartup(IngestionService ingestionService) {
         return args -> {
             log.info("--- Запуск тестовой инжестии при старте приложения ---");
-            // Запустим инжестию для обоих букмекеров
-            // Это создаст/обновит данные в таблицах outcomes, markets, events и т.д.
-            try {
-                ingestionService.ingest("fonbet");
-            } catch (Exception e) {
-                log.error("Ошибка при инжестии Fonbet: ", e);
-            }
+
+
 
             try {
+                log.info("=== НАЧАЛО ЗАГРУЗКИ MARATHON ===");
                 ingestionService.ingest("marathon");
+                log.info("=== ЗАГРУЗКА MARATHON ЗАВЕРШЕНА ===");
             } catch (Exception e) {
                 log.error("Ошибка при инжестии Marathon: ", e);
             }
-            log.info("--- Завершено ---");
+
+//
+//            try {
+//                log.info("=== НАЧАЛО ЗАГРУЗКИ FONBET ===");
+//                ingestionService.ingest("fonbet");
+//                log.info("=== ЗАГРУЗКА FONBET ЗАВЕРШЕНА ===");
+//            } catch (Exception e) {
+//                log.error("Ошибка при инжестии Fonbet: ", e);
+//            }
+//
+//            try {
+//                log.info("=== НАЧАЛО ЗАГРУЗКИ THESPORTSDB ===");
+//                ingestionService.ingest("thesportsdb");
+//                log.info("=== ЗАГРУЗКА THESPORTSDB ЗАВЕРШЕНА ===");
+//            } catch (Exception e) {
+//                log.error("Ошибка при инжестии TheSportsDB: ", e);
+//            }
+
+            log.info("--- ЗАВЕРШЕНО ---");
         };
     }
 }
