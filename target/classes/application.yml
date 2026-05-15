@@ -51,8 +51,8 @@ scheduler:
 # Логирование
 logging:
   level:
-    com.oddscanner: DEBUG
-    com.microsoft.playwright: INFO
+    com.oddscanner.bookmaker.fonbet: DEBUG
+    com.microsoft.playwright: DEBUG
 
 springdoc:
   api-docs:

@@ -8,6 +8,7 @@ import org.jooq.DSLContext;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
+import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 
 @Service
@@ -26,31 +27,38 @@ public class JooqEventMatcher implements EventMatcher {
     }
 
     @Override
-    public EventsRecord findOrCreateCanonicalEvent(Long homeTeamId, Long awayTeamId, Long leagueId, LocalDateTime startTime) {
-        // Ищем событие по ключевым полям
+    public EventsRecord findOrCreateCanonicalEvent(Long homeTeamId, Long awayTeamId,
+                                                   Long leagueId, LocalDateTime startTime,
+                                                   String bookmakerCode) {
+        OffsetDateTime startTimeUtc = startTime.atOffset(ZoneOffset.UTC);
+
+        // Ищем существующее событие
         EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
                 .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
                 .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
-                .and(Tables.EVENTS.LEAGUE_ID.eq(leagueId))
-                .and(Tables.EVENTS.START_TIME.eq(startTime.atOffset(ZoneOffset.UTC))) // Преобразуем в OffsetDateTime
+                .and(Tables.EVENTS.START_TIME.eq(startTimeUtc))
                 .fetchOneInto(EventsRecord.class);
 
         if (existingEvent != null) {
-            return existingEvent; // Нашли существующее событие
+            // Если событие есть, но bookmaker_code не заполнен - обновляем
+            if (existingEvent.getBookmakerCode() == null && bookmakerCode != null) {
+                existingEvent.setBookmakerCode(bookmakerCode);
+                existingEvent.update();
+            }
+            return existingEvent;
         }
 
-        // Создаем новое событие
+        // Создаём новое событие
         EventsRecord newEvent = new EventsRecord();
         newEvent.setHomeTeamId(homeTeamId);
         newEvent.setAwayTeamId(awayTeamId);
         newEvent.setLeagueId(leagueId);
-        newEvent.setStartTime(startTime.atOffset(ZoneOffset.UTC)); // Преобразуем в OffsetDateTime
-        newEvent.setStatus("SCHEDULED"); // Устанавливаем статус по умолчанию
+        newEvent.setStartTime(startTimeUtc);
+        newEvent.setStatus("SCHEDULED");
+        newEvent.setBookmakerCode(bookmakerCode);  // ← НОВОЕ ПОЛЕ
 
         return dsl.insertInto(Tables.EVENTS)
                 .set(newEvent)
-                .onConflict(Tables.EVENTS.HOME_TEAM_ID, Tables.EVENTS.AWAY_TEAM_ID, Tables.EVENTS.START_TIME) // Допустим, это уникальный ключ
-                .doNothing() // Или doUpdate(), если нужно обновлять статус
                 .returning(Tables.EVENTS.fields())
                 .fetchOne()
                 .into(EventsRecord.class);

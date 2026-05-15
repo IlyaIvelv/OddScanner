@@ -24,7 +24,7 @@
         <commons-text.version>1.12.0</commons-text.version>
         <springdoc.version>2.5.0</springdoc.version>
         <argLine>-Dfile.encoding=UTF-8</argLine>
-        <skip.jooq.generation>true</skip.jooq.generation>
+        <skip.jooq.generation>false</skip.jooq.generation>
     </properties>
 
     <profiles>
@@ -68,6 +68,11 @@
             <artifactId>spring-boot-starter-jdbc</artifactId>
         </dependency>
         <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+        </dependency>
+
+        <dependency>
             <groupId>org.jooq</groupId>
             <artifactId>jooq</artifactId>
         </dependency>
@@ -103,6 +108,14 @@
             <artifactId>playwright</artifactId>
             <version>${playwright.version}</version>
         </dependency>
+
+        <!-- Jackson для JSON парсинга -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.core</groupId>
+            <artifactId>jackson-databind</artifactId>
+            <version>2.15.2</version>
+        </dependency>
+
 
         <!-- API Docs -->
         <dependency>

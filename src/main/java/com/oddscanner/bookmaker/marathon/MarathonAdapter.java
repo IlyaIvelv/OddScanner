@@ -31,69 +31,123 @@ public class MarathonAdapter implements BookmakerAdapter {
         return "marathon";
     }
 
+
     @Override
     public List<RawEvent> fetchEvents() {
+        log.info("=== MARATHON fetchEvents() START ===");
         log.info("=== НАЧАЛО ПАРСИНГА MARATHON ===");
 
         List<RawEvent> allEvents = new ArrayList<>();
         marketsCache.clear();
 
-        try (Playwright playwright = Playwright.create()) {
-            Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
-                    .setHeadless(true)  // Можно поставить false для отладки
+        Playwright playwright = null;
+        Browser browser = null;
+        Page page = null;
+
+        try {
+            log.info("Создаем экземпляр Playwright...");
+            playwright = Playwright.create();
+            log.info("Playwright создан успешно");
+
+            log.info("Запускаем браузер Chromium...");
+            browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
+                    .setHeadless(true)
                     .setSlowMo(100)
                     .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
+            log.info("Браузер запущен успешно");
 
-            Page page = browser.newPage();
+            log.info("Создаем новую страницу...");
+            page = browser.newPage();
+            log.info("Страница создана");
 
-            // Заходим на страницу футбола
-            page.navigate(BASE_URL + FOOTBALL_URL);
-            log.info("Загружена страница футбола");
+            String fullUrl = BASE_URL + FOOTBALL_URL;
+            log.info("Загружаем страницу: {}", fullUrl);
+            page.navigate(fullUrl);
+            log.info("Страница загружена, ожидаем загрузки контента...");
 
             // Ждем полной загрузки страницы (включая динамический контент)
+            log.info("Ожидаем NetworkIdle...");
             page.waitForLoadState(LoadState.NETWORKIDLE);
-            page.waitForTimeout(10000); // Даем время на загрузку React компонентов
+            log.info("NetworkIdle достигнут");
 
-            // Ждем появления контейнера с событиями
-            page.waitForSelector("#events_content", new Page.WaitForSelectorOptions().setTimeout(30000));
-            page.waitForSelector(".bg.coupon-row", new Page.WaitForSelectorOptions().setTimeout(30000));
+            log.info("Ожидаем 10 секунд для React компонентов...");
+            page.waitForTimeout(10000);
+            log.info("Ожидание завершено");
+
+            // Проверяем наличие селекторов
+            log.info("Проверяем наличие селектора #events_content...");
+            try {
+                page.waitForSelector("#events_content", new Page.WaitForSelectorOptions().setTimeout(30000));
+                log.info("Селектор #events_content найден");
+            } catch (Exception e) {
+                log.warn("Селектор #events_content НЕ НАЙДЕН: {}", e.getMessage());
+                // Продолжаем выполнение, возможно селектор другой
+            }
+
+            log.info("Проверяем наличие селектора .bg.coupon-row...");
+            try {
+                page.waitForSelector(".bg.coupon-row", new Page.WaitForSelectorOptions().setTimeout(30000));
+                log.info("Селектор .bg.coupon-row найден");
+            } catch (Exception e) {
+                log.warn("Селектор .bg.coupon-row НЕ НАЙДЕН: {}", e.getMessage());
+            }
+
+            // Логируем HTML для отладки (первые 2000 символов)
+            String pageContent = page.content();
+            log.info("Содержимое страницы (первые 2000 символов): {}",
+                    pageContent.length() > 2000 ? pageContent.substring(0, 2000) : pageContent);
 
             // Находим ВСЕ блоки событий на странице
+            log.info("Ищем элементы .bg.coupon-row...");
             List<ElementHandle> eventRows = page.querySelectorAll(".bg.coupon-row");
-            log.info("Найдено событий на странице: {}", eventRows.size());
+            log.info("Найдено элементов .bg.coupon-row: {}", eventRows.size());
+
+            if (eventRows.isEmpty()) {
+                log.warn("НЕ НАЙДЕНО НИ ОДНОГО СОБЫТИЯ! Возможно изменилась структура сайта.");
+                log.info("Доступные классы на странице: {}", getAvailableClasses(page));
+            }
 
             int processedCount = 0;
             int noTeamsCount = 0;
+            int errorCount = 0;
 
-            for (ElementHandle eventRow : eventRows) {
+            for (int i = 0; i < eventRows.size(); i++) {
+                ElementHandle eventRow = eventRows.get(i);
+                log.debug("Обработка события {}", i + 1);
+
                 try {
                     // Получаем ID события
                     String eventId = eventRow.getAttribute("data-event-eventid");
                     if (eventId == null) {
                         eventId = eventRow.getAttribute("data-event-treeid");
+                        log.debug("data-event-eventid не найден, пробуем data-event-treeid: {}", eventId);
                     }
                     if (eventId == null) {
                         eventId = UUID.randomUUID().toString();
+                        log.debug("ID события не найден, генерируем UUID: {}", eventId);
                     }
 
                     // Парсим команды из .member-name
                     List<ElementHandle> memberNames = eventRow.querySelectorAll(".member-name");
                     if (memberNames.size() < 2) {
                         noTeamsCount++;
-                        if (noTeamsCount <= 5) {
-                            log.debug("Не найдены команды для события, текст: {}",
-                                    eventRow.textContent().substring(0, Math.min(200, eventRow.textContent().length())));
+                        if (noTeamsCount <= 10) {
+                            String eventText = eventRow.textContent();
+                            String preview = eventText.length() > 300 ? eventText.substring(0, 300) : eventText;
+                            log.warn("Не найдены команды для события #{}, текст: {}", i + 1, preview);
                         }
                         continue;
                     }
 
                     String homeTeam = memberNames.get(0).textContent().trim();
                     String awayTeam = memberNames.get(1).textContent().trim();
-
-                    log.info("🎯 Найден матч: {} vs {} (ID: {})", homeTeam, awayTeam, eventId);
+                    log.info("🎯 Найден матч #{}: {} vs {} (ID: {})", i + 1, homeTeam, awayTeam, eventId);
 
                     // Парсим рынки
+                    log.debug("Парсим рынки для события {}", eventId);
                     List<RawMarket> markets = parseMarketsFromEventRow(eventRow, eventId);
+                    log.debug("Найдено рынков: {}", markets.size());
+
                     marketsCache.put(eventId, markets);
 
                     // Формируем URL события из data-event-path
@@ -102,7 +156,6 @@ public class MarathonAdapter implements BookmakerAdapter {
                     if (eventPath != null && !eventPath.isEmpty()) {
                         eventUrl = BASE_URL + eventPath;
                     } else {
-                        // Fallback если path нет
                         eventUrl = BASE_URL + "/su/betting/Football/event/" + eventId;
                     }
 
@@ -118,24 +171,88 @@ public class MarathonAdapter implements BookmakerAdapter {
 
                     allEvents.add(rawEvent);
                     processedCount++;
-                    log.info("✅ Добавлено событие {} vs {} с {} рынками", homeTeam, awayTeam, markets.size());
+                    log.info("✅ Добавлено событие #{}: {} vs {} с {} рынками",
+                            processedCount, homeTeam, awayTeam, markets.size());
 
                 } catch (Exception e) {
-                    log.error("Ошибка парсинга события: {}", e.getMessage());
+                    errorCount++;
+                    log.error("Ошибка парсинга события #{}: {}", i + 1, e.getMessage(), e);
                 }
             }
 
-            log.info("Обработано {} событий, пропущено без команд: {}", processedCount, noTeamsCount);
+            log.info("=== ИТОГИ ПАРСИНГА MARATHON ===");
+            log.info("Обработано событий: {}", processedCount);
+            log.info("Пропущено без команд: {}", noTeamsCount);
+            log.info("Ошибок при парсинге: {}", errorCount);
+            log.info("Всего собрано RawEvent: {}", allEvents.size());
 
-            page.close();
-            browser.close();
+            if (allEvents.isEmpty()) {
+                log.warn("MARATHON НЕ НАШЕЛ НИ ОДНОГО СОБЫТИЯ!");
+                log.warn("Проверьте: 1) Доступность сайта {} 2) Структуру страницы", BASE_URL);
+            }
 
         } catch (Exception e) {
-            log.error("Ошибка инициализации браузера: {}", e.getMessage(), e);
+            log.error("!!! КРИТИЧЕСКАЯ ОШИБКА В MARATHON fetchEvents() !!!", e);
+            log.error("Тип ошибки: {}", e.getClass().getName());
+            log.error("Сообщение: {}", e.getMessage());
+
+            // Логируем stack trace полностью
+            for (StackTraceElement element : e.getStackTrace()) {
+                log.error("  at {}", element);
+            }
+
+            return Collections.emptyList();
+
+        } finally {
+            // Закрываем ресурсы в правильном порядке
+            log.info("Закрываем ресурсы Playwright...");
+            try {
+                if (page != null) {
+                    page.close();
+                    log.debug("Page закрыт");
+                }
+            } catch (Exception e) {
+                log.warn("Ошибка при закрытии page: {}", e.getMessage());
+            }
+
+            try {
+                if (browser != null) {
+                    browser.close();
+                    log.debug("Browser закрыт");
+                }
+            } catch (Exception e) {
+                log.warn("Ошибка при закрытии browser: {}", e.getMessage());
+            }
+
+            try {
+                if (playwright != null) {
+                    playwright.close();
+                    log.debug("Playwright закрыт");
+                }
+            } catch (Exception e) {
+                log.warn("Ошибка при закрытии playwright: {}", e.getMessage());
+            }
+
+            log.info("=== MARATHON fetchEvents() FINISHED, returning {} events ===", allEvents.size());
         }
 
-        log.info("=== MARATHON: Всего собрано {} событий ===", allEvents.size());
         return allEvents;
+    }
+
+    // Добавьте этот вспомогательный метод для отладки
+    private String getAvailableClasses(Page page) {
+        try {
+            return page.evaluate("() => {" +
+                    "const elements = document.querySelectorAll('[class]');" +
+                    "const classes = new Set();" +
+                    "elements.forEach(el => {" +
+                    "  el.className.split(' ').forEach(c => classes.add(c));" +
+                    "});" +
+                    "return Array.from(classes).slice(0, 50).join(', ');" +
+                    "}").toString();
+        } catch (Exception e) {
+            return "Unable to get classes: " + e.getMessage();
+        }
     }
 
     /**

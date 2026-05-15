@@ -74,8 +74,22 @@ public class IngestionService {
      * Интервал настраивается в application.yml (scheduler.fixed-delay-ms)
      * По умолчанию: 5 минут (300000 мс)
      */
-    @Scheduled(fixedDelayString = "${scheduler.fixed-delay-ms:300000}")
+    @Scheduled(fixedDelayString = "${scheduler.fixed-delay-ms:300000}", initialDelay = 5000) // через 5 сек, затем каждые 5 мин
     public void scheduledIngestion() {
+
+        var allBookmakers = dsl.selectFrom(Tables.BOOKMAKERS).fetch();
+        for (var bm : allBookmakers) {
+            log.info("  Букмекер: code='{}', name='{}', enabled={}",
+                    bm.getCode(), bm.getName(), bm.getEnabled());
+        }
+        log.info("  schedulerEnabled='{}'", schedulerEnabled);
+
+        log.info("=== ДИАГНОСТИКА: Зарегистрированные адаптеры ===");
+        for (String key : adapters.keySet()) {
+            log.info("  Адаптер: code='{}', class={}", key, adapters.get(key).getClass().getSimpleName());
+        }
+
+
         if (!schedulerEnabled) {
             log.debug("Планировщик отключен в конфигурации");
             return;
@@ -116,6 +130,7 @@ public class IngestionService {
     }
 
     public void ingest(String bookmakerCode) {
+        log.info(">>> INGEST CALLED for bookmaker: {}", bookmakerCode);  //
         log.info("Starting ingestion for bookmaker: {}", bookmakerCode);
 
         // Проверяем, активен ли букмекер в БД
@@ -138,6 +153,7 @@ public class IngestionService {
                 bookmakerCode, bookmaker.getName());
 
         BookmakerAdapter adapter = adapters.get(bookmakerCode);
+        log.info("Adapter for {}: {}", bookmakerCode, adapter);  // <-- ДОБАВИТЬ
         if (adapter == null) {
             log.error("No adapter found for bookmaker code: {}", bookmakerCode);
             return;
@@ -301,6 +317,7 @@ public class IngestionService {
         eventRecord.setStartTime(rawEvent.getStartTime().atOffset(ZoneOffset.UTC));
         eventRecord.setStatus("SCHEDULED");
         eventRecord.setEventUrl(rawEvent.getEventUrl());
+        eventRecord.setBookmakerCode(bookmakerCode);  // <-- ВОТ ЭТА СТРОЧКА БЫЛА ОТСУТСТВОВАЛА!
 
         EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
                 .set(eventRecord)
@@ -313,7 +330,8 @@ public class IngestionService {
         }
 
         Long internalEventId = savedEvent.getId();
-        log.debug("Created new event ID: {} for {} vs {}", internalEventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+        log.debug("Created new event ID: {} for {} vs {} (bookmaker: {})",
+                internalEventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), bookmakerCode);
 
         // Сохраняем внешнюю ссылку
         Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
@@ -338,6 +356,7 @@ public class IngestionService {
 
         return internalEventId;
     }
+
 
     private Long findOrCreateTeam(String teamName, Long sportId) {
         if (teamName == null || teamName.isEmpty() || "TBD".equals(teamName)) {

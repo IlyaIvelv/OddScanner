@@ -1,7 +1,13 @@
+// src/main/java/com/oddscanner/bookmaker/fonbet/FonbetApiAdapter.java
+
 package com.oddscanner.bookmaker.fonbet;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.microsoft.playwright.Browser;
+import com.microsoft.playwright.BrowserType;
 import com.microsoft.playwright.Page;
-import com.microsoft.playwright.ElementHandle;
+import com.microsoft.playwright.Playwright;
 import com.microsoft.playwright.options.LoadState;
 import com.oddscanner.bookmaker.api.BookmakerAdapter;
 import com.oddscanner.bookmaker.api.RawEvent;
@@ -11,259 +17,512 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.nio.file.Files;
-import java.nio.file.Path;
-import java.nio.file.Paths;
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.time.LocalDateTime;
 import java.util.*;
 
 @Component
 public class FonbetAdapter implements BookmakerAdapter {
-
     private static final Logger log = LoggerFactory.getLogger(FonbetAdapter.class);
-    private static final String BOOKMAKER_NAME = "fonbet";
-    private static final String URL_LIVE = "https://fon.bet/live/football";
+    private static final String BASE_URL = "https://fon.bet";
 
-    // CSS селекторы с использованием частичного совпадения (динамические классы)
-    private static final String EVENT_CONTAINER_SELECTOR = "[class*='sport-base-event-wrap']";
-    private static final String EVENT_MAIN_SELECTOR = "[class*='sport-base-event--']";
-    private static final String TEAM_NAME_SELECTOR = "[class*='sport-base-event__main__caption__rendertron']";
-    private static final String SCORE_SELECTOR = "[class*='event-block-score--']";
-    private static final String TIME_SELECTOR = "[class*='event-block-current-time__time--']";
-    private static final String FACTOR_CONTAINER_SELECTOR = "[class*='factor-value--']";
-    private static final String FACTOR_VALUE_SELECTOR = "[class*='value--']";
-    private static final String FACTOR_PARAM_SELECTOR = "[class*='param--']";
+    private final HttpClient httpClient = HttpClient.newBuilder()
+            .version(HttpClient.Version.HTTP_1_1)
+            .build();
+    private final ObjectMapper mapper = new ObjectMapper();
+
+    private final Map<String, List<RawMarket>> marketsCache = new HashMap<>();
 
     @Override
     public String code() {
-        return BOOKMAKER_NAME;
+        return "fonbet";
     }
 
     @Override
     public List<RawEvent> fetchEvents() {
-        log.info("Starting to fetch events from Fonbet");
+        log.info("=== НАЧАЛО ПАРСИНГА FONBET ===");
 
-        Page page = null;
-        com.microsoft.playwright.Playwright playwright = null;
-        com.microsoft.playwright.Browser browser = null;
+        List<RawEvent> allEvents = new ArrayList<>();
+        marketsCache.clear();
 
         try {
-            playwright = com.microsoft.playwright.Playwright.create();
-            browser = playwright.chromium().launch(
-                    new com.microsoft.playwright.BrowserType.LaunchOptions().setHeadless(false) // Для отладки лучше false
-            );
-            page = browser.newPage();
+            String apiBaseUrl = discoverApiBaseUrl();
 
-            page.navigate(URL_LIVE);
+            if (apiBaseUrl == null) {
+                log.error("Не удалось определить API базовый URL");
+                return allEvents;
+            }
+
+            String apiUrl = apiBaseUrl + "/ma/events/list?lang=ru&scopeMarket=1600&version=" + System.currentTimeMillis();
+            log.info("API URL: {}", apiUrl);
+
+            String response = fetchApiData(apiUrl);
+
+            if (response == null) {
+                log.error("Не удалось получить данные от API");
+                return allEvents;
+            }
+
+            allEvents = parseApiResponse(response);
+
+        } catch (Exception e) {
+            log.error("Ошибка при парсинге Fonbet: {}", e.getMessage(), e);
+        }
+
+        log.info("=== FONBET: Всего собрано {} событий ===", allEvents.size());
+        return allEvents;
+    }
+
+    private String discoverApiBaseUrl() {
+        log.info("Обнаружение API базового URL через Playwright...");
+
+        try (Playwright playwright = Playwright.create()) {
+            Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
+                    .setHeadless(true)
+                    .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
+
+            Page page = browser.newPage();
+
+            page.setExtraHTTPHeaders(Map.of(
+                    "Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
+                    "User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+            ));
+
+            log.info("Загружаем главную страницу: {}", BASE_URL);
+            page.navigate(BASE_URL);
             page.waitForLoadState(LoadState.NETWORKIDLE);
-            Thread.sleep(5000); // Даем время для полной загрузки динамического контента
+            page.waitForTimeout(5000);
 
-            savePageSource(page);
+            // Перехватываем сетевые запросы
+            List<String> apiUrls = new ArrayList<>();
+            page.onRequest(request -> {
+                String url = request.url();
+                if (url.contains("/ma/events/list") && url.contains("bk6bba-resources")) {
+                    String base = url.replaceAll("/ma/events/list\\?.*$", "");
+                    if (!apiUrls.contains(base)) {
+                        apiUrls.add(base);
+                        log.debug("Найден API запрос: {}", base);
+                    }
+                }
+            });
 
-            // Ждем появления событий
-            page.waitForSelector(EVENT_CONTAINER_SELECTOR, new Page.WaitForSelectorOptions().setTimeout(30000));
+            // Перезагружаем страницу
+            page.reload();
+            page.waitForLoadState(LoadState.NETWORKIDLE);
+            page.waitForTimeout(5000);
 
-            List<ElementHandle> eventContainers = page.querySelectorAll(EVENT_CONTAINER_SELECTOR);
-            log.info("Found {} event containers", eventContainers.size());
+            if (!apiUrls.isEmpty()) {
+                page.close();
+                browser.close();
+                return apiUrls.get(0);
+            }
 
-            List<RawEvent> events = new ArrayList<>();
+            page.close();
+            browser.close();
 
-            for (ElementHandle container : eventContainers) {
+        } catch (Exception e) {
+            log.error("Ошибка при обнаружении API URL: {}", e.getMessage(), e);
+        }
+
+        log.warn("Не удалось обнаружить API базовый URL");
+        return null;
+    }
+
+    private String fetchApiData(String url) throws IOException, InterruptedException {
+        log.debug("Запрос к API: {}", url);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(url))
+                .header("Accept", "*/*")
+                .header("Accept-Encoding", "gzip, deflate, br")  // КЛЮЧЕВОЙ ЗАГОЛОВОК
+                .header("Accept-Language", "ru-RU,ru;q=0.9")
+                .header("Origin", BASE_URL)
+                .header("Referer", BASE_URL + "/")
+                .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                .GET()
+                .build();
+
+        // Получаем как байты, а не как строку
+        HttpResponse<byte[]> response = httpClient.send(request, HttpResponse.BodyHandlers.ofByteArray());
+
+        if (response.statusCode() == 200) {
+            byte[] body = response.body();
+            log.info("API запрос успешен, размер: {} bytes", body.length);
+
+            // Распаковываем если нужно
+            String contentEncoding = response.headers().firstValue("Content-Encoding").orElse("");
+            String responseBody;
+
+            if ("gzip".equals(contentEncoding) || "deflate".equals(contentEncoding)) {
+                responseBody = decompressGzip(body);
+                log.info("Распакован GZIP ответ, размер: {} bytes", responseBody.length());
+            } else if ("br".equals(contentEncoding)) {
+                responseBody = decompressBrotli(body);
+                log.info("Распакован Brotli ответ, размер: {} bytes", responseBody.length());
+            } else {
+                responseBody = new String(body, java.nio.charset.StandardCharsets.UTF_8);
+            }
+
+            return responseBody;
+        }
+
+        log.warn("API запрос вернул статус: {}", response.statusCode());
+        return null;
+    }
+
+    private List<RawEvent> parseApiResponse(String jsonResponse) {
+        List<RawEvent> events = new ArrayList<>();
+
+        try {
+            JsonNode root = mapper.readTree(jsonResponse);
+            JsonNode eventsNode = findEventsNode(root);
+
+            if (eventsNode == null || !eventsNode.isArray()) {
+                log.error("Не найден массив событий в ответе API");
+                return events;
+            }
+
+            log.info("Найдено {} событий в ответе API", eventsNode.size());
+
+            for (JsonNode eventNode : eventsNode) {
                 try {
-                    RawEvent event = parseEvent(container);
-                    if (event != null && event.getMarkets() != null && !event.getMarkets().isEmpty()) {
+                    RawEvent event = parseEventNode(eventNode);
+                    if (event != null && event.getHomeTeamName() != null && event.getAwayTeamName() != null) {
                         events.add(event);
-                        log.info("✓ Parsed: {} | Score: {}:{}",
-                                event.getName(), event.getHomeScore(), event.getAwayScore());
+                        log.debug("Добавлено событие: {} vs {}", event.getHomeTeamName(), event.getAwayTeamName());
                     }
                 } catch (Exception e) {
-                    log.warn("Failed to parse event: {}", e.getMessage());
+                    log.debug("Ошибка парсинга события: {}", e.getMessage());
                 }
             }
 
-            log.info("Successfully parsed {} events from Fonbet", events.size());
-            return events;
-
         } catch (Exception e) {
-            log.error("Failed to fetch events from Fonbet", e);
-            return Collections.emptyList();
-        } finally {
-            if (page != null && !page.isClosed()) page.close();
-            if (browser != null) browser.close();
-            if (playwright != null) playwright.close();
+            log.error("Ошибка парсинга JSON: {}", e.getMessage(), e);
         }
+
+        return events;
     }
 
-    @Override
-    public List<RawMarket> fetchMarkets(String eventId) {
-        return Collections.emptyList();
+    private JsonNode findEventsNode(JsonNode root) {
+        String[] possiblePaths = {"events", "data", "items", "list", "result"};
+
+        for (String path : possiblePaths) {
+            JsonNode node = root.get(path);
+            if (node != null && node.isArray() && node.size() > 0) {
+                log.debug("Найдены события по пути: {}", path);
+                return node;
+            }
+        }
+
+        if (root.isArray() && root.size() > 0) {
+            log.debug("Корневой узел является массивом событий");
+            return root;
+        }
+
+        Iterator<Map.Entry<String, JsonNode>> fields = root.fields();
+        while (fields.hasNext()) {
+            Map.Entry<String, JsonNode> field = fields.next();
+            JsonNode value = field.getValue();
+            if (value.isArray() && value.size() > 0) {
+                JsonNode first = value.get(0);
+                if (first.has("homeTeam") || first.has("team1") || first.has("participants")) {
+                    log.debug("Найдены события по полю: {}", field.getKey());
+                    return value;
+                }
+            }
+        }
+
+        return null;
     }
 
-    private RawEvent parseEvent(ElementHandle container) {
-        // Ищем основной блок события
-        ElementHandle mainBlock = container.querySelector(EVENT_MAIN_SELECTOR);
-        if (mainBlock == null) {
-            log.debug("Main block not found");
+    private RawEvent parseEventNode(JsonNode eventNode) {
+        String eventId = getStringField(eventNode, "id", "eventId", "externalId");
+        if (eventId == null || eventId.isEmpty()) {
+            eventId = "fonbet_" + UUID.randomUUID();
+        }
+
+        String homeTeam = parseHomeTeam(eventNode);
+        String awayTeam = parseAwayTeam(eventNode);
+
+        if (homeTeam == null || awayTeam == null) {
             return null;
         }
 
-        // Извлекаем название матча
-        ElementHandle teamNameElement = mainBlock.querySelector(TEAM_NAME_SELECTOR);
-        if (teamNameElement == null) {
-            log.debug("Team name element not found");
-            return null;
-        }
+        LocalDateTime startTime = parseStartTime(eventNode);
+        String league = parseLeague(eventNode);
 
-        String matchName = teamNameElement.textContent().trim();
-        if (matchName.isEmpty()) return null;
-
-        String[] teams = splitTeams(matchName);
-        String homeTeam = teams[0];
-        String awayTeam = teams[1];
-
-        // Извлекаем счет
-        String scoreText = "0:0";
-        ElementHandle scoreElement = mainBlock.querySelector(SCORE_SELECTOR);
-        if (scoreElement != null && scoreElement.textContent() != null) {
-            scoreText = scoreElement.textContent().trim();
-        }
-        int[] scores = parseScore(scoreText);
-
-        // Извлекаем время
-        String time = "";
-        ElementHandle timeElement = mainBlock.querySelector(TIME_SELECTOR);
-        if (timeElement != null && timeElement.textContent() != null) {
-            time = timeElement.textContent().trim();
-        }
-
-        // Извлекаем коэффициенты
-        List<RawMarket> markets = extractMarkets(mainBlock);
-
-        if (markets.isEmpty()) return null;
+        List<RawMarket> markets = parseMarkets(eventNode, eventId);
+        marketsCache.put(eventId, markets);
 
         RawEvent event = new RawEvent();
-        event.setBookmakerId(BOOKMAKER_NAME);
-        event.setName(matchName);
-        event.setHomeTeam(homeTeam);
-        event.setAwayTeam(awayTeam);
-        event.setHomeScore(scores[0]);
-        event.setAwayScore(scores[1]);
-        event.setEventTime(time);
+        event.setExternalId(eventId);
+        event.setHomeTeamName(homeTeam);
+        event.setAwayTeamName(awayTeam);
+        event.setStartTime(startTime != null ? startTime : LocalDateTime.now().plusDays(7));
+        event.setLeagueName(league != null ? league : "Unknown League");
+        event.setSportName("Football");
+        event.setEventUrl(BASE_URL + "/live/football");
         event.setMarkets(markets);
-        event.setUpdatedAt(LocalDateTime.now());
 
         return event;
     }
 
-    private List<RawMarket> extractMarkets(ElementHandle mainBlock) {
-        List<RawMarket> markets = new ArrayList<>();
-
-        // Находим все блоки с коэффициентами
-        List<ElementHandle> factorBlocks = mainBlock.querySelectorAll(FACTOR_CONTAINER_SELECTOR);
-        log.debug("Found {} factor blocks", factorBlocks.size());
-
-        if (factorBlocks.isEmpty()) return markets;
-
-        // Рынок исходов (первые 3 коэффициента - это 1, X, 2)
-        RawMarket matchWinnerMarket = new RawMarket();
-        matchWinnerMarket.setType("MATCH_WINNER");
-        matchWinnerMarket.setId(UUID.randomUUID().toString());
-
-        List<RawOutcome> outcomes = new ArrayList<>();
-        String[] selectionNames = {"1", "X", "2"};
-
-        for (int i = 0; i < Math.min(3, factorBlocks.size()); i++) {
-            ElementHandle factorBlock = factorBlocks.get(i);
-            RawOutcome outcome = parseOutcome(factorBlock);
-
-            if (outcome != null && outcome.getValue() > 0) {
-                outcome.setName(selectionNames[i]);
-                outcome.setId(UUID.randomUUID().toString());
-                outcomes.add(outcome);
-                log.debug("  Outcome {}: {}", selectionNames[i], outcome.getValue());
+    private String parseHomeTeam(JsonNode eventNode) {
+        String[] fieldNames = {"homeTeam", "team1", "home", "participant1", "homeName"};
+        for (String name : fieldNames) {
+            String team = getStringField(eventNode, name);
+            if (team != null && !team.isEmpty()) {
+                return cleanTeamName(team);
             }
         }
 
-        if (!outcomes.isEmpty()) {
-            matchWinnerMarket.setOutcomes(outcomes);
-            markets.add(matchWinnerMarket);
+        JsonNode participants = eventNode.get("participants");
+        if (participants != null && participants.isArray() && participants.size() >= 2) {
+            return cleanTeamName(getStringField(participants.get(0), "name", "title"));
+        }
+
+        return null;
+    }
+
+    private String parseAwayTeam(JsonNode eventNode) {
+        String[] fieldNames = {"awayTeam", "team2", "away", "participant2", "awayName"};
+        for (String name : fieldNames) {
+            String team = getStringField(eventNode, name);
+            if (team != null && !team.isEmpty()) {
+                return cleanTeamName(team);
+            }
+        }
+
+        JsonNode participants = eventNode.get("participants");
+        if (participants != null && participants.isArray() && participants.size() >= 2) {
+            return cleanTeamName(getStringField(participants.get(1), "name", "title"));
+        }
+
+        return null;
+    }
+
+    private LocalDateTime parseStartTime(JsonNode eventNode) {
+        String[] fieldNames = {"startTime", "date", "kickoff", "startDate"};
+        for (String name : fieldNames) {
+            String timeStr = getStringField(eventNode, name);
+            if (timeStr != null && !timeStr.isEmpty()) {
+                try {
+                    return LocalDateTime.parse(timeStr);
+                } catch (Exception e) {
+                    log.debug("Не удалось распарсить время: {}", timeStr);
+                }
+            }
+        }
+        return null;
+    }
+
+    private String parseLeague(JsonNode eventNode) {
+        String[] fieldNames = {"league", "tournament", "competition", "category", "leagueName"};
+        for (String name : fieldNames) {
+            String league = getStringField(eventNode, name);
+            if (league != null && !league.isEmpty() && league.length() < 100) {
+                return cleanTeamName(league);
+            }
+        }
+        return null;
+    }
+
+    private List<RawMarket> parseMarkets(JsonNode eventNode, String eventId) {
+        List<RawMarket> markets = new ArrayList<>();
+
+        JsonNode marketsNode = eventNode.get("markets");
+        if (marketsNode == null) {
+            marketsNode = eventNode.get("betGroups");
+        }
+
+        if (marketsNode != null && marketsNode.isArray()) {
+            for (JsonNode marketNode : marketsNode) {
+                RawMarket market = parseMarketNode(marketNode, eventId);
+                if (market != null && market.getOutcomes() != null && !market.getOutcomes().isEmpty()) {
+                    markets.add(market);
+                }
+            }
         }
 
         return markets;
     }
 
-    private RawOutcome parseOutcome(ElementHandle factorBlock) {
-        try {
-            ElementHandle valueElement = factorBlock.querySelector(FACTOR_VALUE_SELECTOR);
-            if (valueElement == null) {
-                // Пробуем альтернативный селектор внутри блока
-                valueElement = factorBlock.querySelector("[class*='value']");
-                if (valueElement == null) return null;
-            }
+    private RawMarket parseMarketNode(JsonNode marketNode, String eventId) {
+        String marketId = getStringField(marketNode, "id", "marketId");
+        if (marketId == null) {
+            marketId = eventId + "_" + UUID.randomUUID();
+        }
 
-            String valueStr = valueElement.textContent().trim();
-            log.debug("  Raw value string: '{}'", valueStr);
+        String marketType = getStringField(marketNode, "type", "marketType", "name");
+        if (marketType == null) {
+            marketType = "WIN_DRAW_WIN";
+        }
 
-            if (valueStr.equals("-") || valueStr.isEmpty()) return null;
+        String period = getStringField(marketNode, "period", "periodName");
+        if (period == null) {
+            period = "FULL_TIME";
+        }
 
-            // Очищаем от лишних символов и пробелов
-            valueStr = valueStr.replaceAll("[^\\d.]", "");
-            if (valueStr.isEmpty()) return null;
+        BigDecimal line = null;
+        JsonNode lineNode = marketNode.get("line");
+        if (lineNode != null && lineNode.isNumber()) {
+            line = BigDecimal.valueOf(lineNode.asDouble());
+        }
 
-            double oddValue;
-            try {
-                oddValue = Double.parseDouble(valueStr);
-            } catch (NumberFormatException e) {
-                log.debug("Failed to parse value: {}", valueStr);
-                return null;
-            }
+        List<RawOutcome> outcomes = parseOutcomes(marketNode, marketId);
 
-            if (oddValue <= 0) return null;
-
-            RawOutcome outcome = new RawOutcome();
-            outcome.setValue(oddValue);
-
-            return outcome;
-        } catch (Exception e) {
-            log.debug("Error parsing outcome: {}", e.getMessage());
+        if (outcomes.isEmpty()) {
             return null;
         }
+
+        return RawMarket.builder()
+                .externalId(marketId)
+                .externalEventId(eventId)
+                .marketTypeName(normalizeMarketType(marketType))
+                .periodName(period)
+                .line(line)
+                .outcomes(outcomes)
+                .build();
     }
 
-    private String[] splitTeams(String matchName) {
-        String[] parts = matchName.split(" - ");
-        if (parts.length == 2) {
-            return new String[]{parts[0].trim(), parts[1].trim()};
+    private List<RawOutcome> parseOutcomes(JsonNode marketNode, String marketId) {
+        List<RawOutcome> outcomes = new ArrayList<>();
+
+        JsonNode outcomesNode = marketNode.get("outcomes");
+        if (outcomesNode == null) {
+            outcomesNode = marketNode.get("selections");
         }
-        // Если разделитель другой (например, " vs ")
-        parts = matchName.split(" vs ");
-        if (parts.length == 2) {
-            return new String[]{parts[0].trim(), parts[1].trim()};
+
+        if (outcomesNode != null && outcomesNode.isArray()) {
+            for (JsonNode outcomeNode : outcomesNode) {
+                RawOutcome outcome = parseOutcomeNode(outcomeNode, marketId);
+                if (outcome != null && outcome.getOdds() != null) {
+                    outcomes.add(outcome);
+                }
+            }
         }
-        return new String[]{matchName, ""};
+
+        return outcomes;
     }
 
-    private int[] parseScore(String scoreText) {
-        if (scoreText == null || scoreText.isEmpty()) return new int[]{0, 0};
-        // Очищаем от возможных комментариев в скобках (например, "0:0 (0-0)")
-        scoreText = scoreText.split("\\(")[0].trim();
-        String[] parts = scoreText.split(":");
-        if (parts.length != 2) return new int[]{0, 0};
+    private RawOutcome parseOutcomeNode(JsonNode outcomeNode, String marketId) {
+        String outcomeKey = getStringField(outcomeNode, "key", "type", "outcomeKey");
+        if (outcomeKey == null) {
+            outcomeKey = "UNKNOWN";
+        }
+
+        String outcomeDesc = getStringField(outcomeNode, "value", "description", "label", "name");
+        if (outcomeDesc == null) {
+            outcomeDesc = outcomeKey;
+        }
+
+        BigDecimal odds = null;
+        JsonNode oddsNode = outcomeNode.get("odds");
+        if (oddsNode == null) {
+            oddsNode = outcomeNode.get("price");
+        }
+        if (oddsNode == null) {
+            oddsNode = outcomeNode.get("coefficient");
+        }
+
+        if (oddsNode != null) {
+            if (oddsNode.isNumber()) {
+                odds = BigDecimal.valueOf(oddsNode.asDouble());
+            } else if (oddsNode.isTextual()) {
+                try {
+                    String oddsStr = oddsNode.asText().replace(",", ".");
+                    odds = new BigDecimal(oddsStr);
+                } catch (Exception e) {
+                    log.debug("Не удалось распарсить коэффициент: {}", oddsNode.asText());
+                }
+            }
+        }
+
+        boolean isActive = true;
+        JsonNode activeNode = outcomeNode.get("isActive");
+        if (activeNode != null && activeNode.isBoolean()) {
+            isActive = activeNode.asBoolean();
+        }
+
+        if (odds == null) {
+            return null;
+        }
+
+        return RawOutcome.builder()
+                .externalMarketId(marketId)
+                .outcomeKeyName(outcomeKey)
+                .outcomeValueDescription(outcomeDesc)
+                .odds(odds)
+                .isActive(isActive)
+                .build();
+    }
+
+    private String getStringField(JsonNode node, String... fieldNames) {
+        for (String fieldName : fieldNames) {
+            JsonNode field = node.get(fieldName);
+            if (field != null && !field.isMissingNode() && field.isTextual()) {
+                String value = field.asText();
+                if (value != null && !value.isEmpty()) {
+                    return value;
+                }
+            }
+        }
+        return null;
+    }
+
+    private String cleanTeamName(String name) {
+        if (name == null) return null;
+        return name.replaceAll("\\s+", " ").trim();
+    }
+
+    private String normalizeMarketType(String type) {
+        if (type == null) return "WIN_DRAW_WIN";
+
+        String upper = type.toUpperCase();
+        if (upper.contains("1X2") || upper.contains("WIN_DRAW_WIN") || upper.contains("RESULT")) {
+            return "WIN_DRAW_WIN";
+        }
+        if (upper.contains("HANDICAP") || upper.contains("FORA")) {
+            return "HANDICAP";
+        }
+        if (upper.contains("TOTAL") || upper.contains("GOALS")) {
+            return "TOTAL_GOALS";
+        }
+        if (upper.contains("DOUBLE")) {
+            return "DOUBLE_CHANCE";
+        }
+        return type;
+    }
+
+    @Override
+    public List<RawMarket> fetchMarkets(String externalEventId) {
+        return marketsCache.getOrDefault(externalEventId, new ArrayList<>());
+    }
+
+
+    private String decompressGzip(byte[] compressed) throws IOException {
+        try (ByteArrayInputStream bis = new ByteArrayInputStream(compressed);
+             java.util.zip.GZIPInputStream gis = new java.util.zip.GZIPInputStream(bis)) {
+            return new String(gis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+        }
+    }
+
+    private String decompressBrotli(byte[] compressed) {
         try {
-            return new int[]{Integer.parseInt(parts[0].trim()), Integer.parseInt(parts[1].trim())};
-        } catch (NumberFormatException e) {
-            return new int[]{0, 0};
-        }
-    }
-
-    private void savePageSource(Page page) {
-        try {
-            String content = page.content();
-            Path path = Paths.get("fonbet_debug.html");
-            Files.writeString(path, content);
-            log.info("Saved page source to {}", path.toAbsolutePath());
+            // Brotli через Playwright или отдельную библиотеку
+            // Простой вариант - попробовать как gzip
+            return decompressGzip(compressed);
         } catch (Exception e) {
-            log.warn("Failed to save page source: {}", e.getMessage());
+            // Если Brotli не получился, пробуем как есть
+            log.warn("Не удалось распаковать Brotli, пробуем как обычную строку");
+            return new String(compressed, java.nio.charset.StandardCharsets.UTF_8);
         }
     }
+
 }
