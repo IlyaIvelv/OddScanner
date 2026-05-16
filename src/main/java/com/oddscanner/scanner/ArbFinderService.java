@@ -76,6 +76,36 @@ public class ArbFinderService {
         return normalized.trim();
     }
 
+    private Long findMatchedEventId(String homeTeam, String awayTeam, OffsetDateTime startTime, Long currentEventId) {
+        // Ищем событие в БД с похожими командами и временем
+        var homeTeamAlias = Tables.TEAMS.as("home_team");
+        var awayTeamAlias = Tables.TEAMS.as("away_team");
+
+        var possibleMatches = dsl.select(
+                        Tables.EVENTS.ID,
+                        homeTeamAlias.CANONICAL_NAME.as("home"),
+                        awayTeamAlias.CANONICAL_NAME.as("away"),
+                        Tables.EVENTS.START_TIME
+                )
+                .from(Tables.EVENTS)
+                .join(homeTeamAlias).on(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamAlias.ID))
+                .join(awayTeamAlias).on(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamAlias.ID))
+                .where(Tables.EVENTS.ID.ne(currentEventId))
+                .fetch();
+
+        for (var match : possibleMatches) {
+            String dbHome = match.get("home", String.class);
+            String dbAway = match.get("away", String.class);
+            OffsetDateTime dbTime = match.get(Tables.EVENTS.START_TIME);
+
+            if (isSameMatch(homeTeam, awayTeam, dbHome, dbAway) && isSameTime(startTime, dbTime)) {
+                return match.get(Tables.EVENTS.ID);
+            }
+        }
+
+        return null;
+    }
+
     private boolean isSameMatch(String home1, String away1, String home2, String away2) {
         String normHome1 = normalizeTeamName(home1);
         String normAway1 = normalizeTeamName(away1);
@@ -107,14 +137,13 @@ public class ArbFinderService {
                         Tables.OUTCOMES.OUTCOME_KEY,
                         Tables.OUTCOMES.ODDS,
                         Tables.OUTCOMES.IS_ACTIVE,
-                        // Tables.MARKETS.ID.as("market_id"),  // УБРАТЬ - уже есть выше
                         Tables.MARKETS.EVENT_ID,
                         Tables.MARKETS.BOOKMAKER_ID,
                         Tables.MARKETS.MARKET_TYPE,
                         Tables.BOOKMAKERS.CODE.as("bookmaker_code"),
                         Tables.BOOKMAKERS.NAME.as("bookmaker_name"),
-                        // Tables.EVENTS.ID.as("event_id"),   // УБРАТЬ - будет дубль
                         Tables.EVENTS.START_TIME,
+                        Tables.EVENTS.LEAGUE_ID,
                         homeTeam.CANONICAL_NAME.as("home_team"),
                         awayTeam.CANONICAL_NAME.as("away_team")
                 )
@@ -129,40 +158,18 @@ public class ArbFinderService {
 
         log.info("Найдено {} активных исходов для анализа", sql.size());
 
-        // Группируем по событиям
-        Map<String, List<Map<String, Object>>> matchedEvents = new HashMap<>();
+        // Группируем по событиям (уже по event_id, потому что матчинг сделал своё дело!)
+        Map<Long, List<Map<String, Object>>> eventsGroup = new HashMap<>();
 
         for (var record : sql) {
-            String homeTeamName = record.get("home_team", String.class);
-            String awayTeamName = record.get("away_team", String.class);
-            OffsetDateTime startTime = record.get("start_time", OffsetDateTime.class);
-
-            boolean matched = false;
-            for (Map.Entry<String, List<Map<String, Object>>> entry : matchedEvents.entrySet()) {
-                Map<String, Object> first = entry.getValue().get(0);
-                String existingHome = (String) first.get("home_team");
-                String existingAway = (String) first.get("away_team");
-                OffsetDateTime existingTime = (OffsetDateTime) first.get("start_time");
-
-                if (isSameMatch(homeTeamName, awayTeamName, existingHome, existingAway) &&
-                        isSameTime(startTime, existingTime)) {
-                    entry.getValue().add(record.intoMap());
-                    matched = true;
-                    break;
-                }
-            }
-
-            if (!matched) {
-                List<Map<String, Object>> newList = new ArrayList<>();
-                newList.add(record.intoMap());
-                matchedEvents.put(UUID.randomUUID().toString(), newList);
-            }
+            Long eventId = record.get(Tables.MARKETS.EVENT_ID);
+            eventsGroup.computeIfAbsent(eventId, k -> new ArrayList<>()).add(record.intoMap());
         }
 
-        log.info("Сматчено {} уникальных событий", matchedEvents.size());
+        log.info("Найдено {} уникальных событий", eventsGroup.size());
 
         // Анализируем каждое событие
-        for (List<Map<String, Object>> outcomes : matchedEvents.values()) {
+        for (List<Map<String, Object>> outcomes : eventsGroup.values()) {
             Map<String, Map<String, Object>> bestOutcomes = new HashMap<>();
 
             Map<String, List<Map<String, Object>>> byOutcomeKey = outcomes.stream()

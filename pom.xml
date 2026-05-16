@@ -24,7 +24,7 @@
         <commons-text.version>1.12.0</commons-text.version>
         <springdoc.version>2.5.0</springdoc.version>
         <argLine>-Dfile.encoding=UTF-8</argLine>
-        <skip.jooq.generation>false</skip.jooq.generation>
+        <skip.jooq.generation>true</skip.jooq.generation>
     </properties>
 
     <profiles>

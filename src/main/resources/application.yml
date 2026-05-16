@@ -21,7 +21,7 @@ oddscanner:
     global-seconds: 30
   bookmakers:
     fonbet:
-      enabled: false
+      enabled: true
       base-url: https://www.fon.bet
       refresh-seconds: 30
     marathon:

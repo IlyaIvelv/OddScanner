@@ -236,6 +236,11 @@ public class MarathonAdapter implements BookmakerAdapter {
             log.info("=== MARATHON fetchEvents() FINISHED, returning {} events ===", allEvents.size());
         }
 
+        log.info("=== MARATHON: Найдено {} событий ===", allEvents.size());
+        for (RawEvent e : allEvents) {
+            log.info("  Marathon event: {} vs {}", e.getHomeTeamName(), e.getAwayTeamName());
+        }
+
         return allEvents;
     }
 

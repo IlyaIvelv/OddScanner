@@ -7,6 +7,7 @@ import com.oddscanner.bookmaker.api.RawOutcome;
 import com.oddscanner.generated.Tables;
 import com.oddscanner.generated.tables.records.EventsRecord;
 import com.oddscanner.generated.tables.records.EventExternalRefsRecord;
+import com.oddscanner.generated.tables.records.LeaguesRecord;
 import com.oddscanner.generated.tables.records.MarketsRecord;
 import com.oddscanner.generated.tables.records.OutcomesRecord;
 import com.oddscanner.generated.tables.records.TeamsRecord;
@@ -14,6 +15,7 @@ import com.oddscanner.normalization.EventMatcher;
 import com.oddscanner.normalization.LeagueMatcher;
 import com.oddscanner.normalization.SportMatcher;
 import com.oddscanner.normalization.TeamMatcher;
+import com.oddscanner.scanner.EventMatcherService;
 import org.jooq.DSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,7 +54,7 @@ public class IngestionService {
     public IngestionService(List<BookmakerAdapter> adapterList,
                             DSLContext dsl,
                             EventMatcher eventMatcher,
-                            TeamMatcher teamMatcher,
+                            TeamMatcher teamMatcher,  // ← ДОЛЖЕН БЫТЬ
                             LeagueMatcher leagueMatcher,
                             SportMatcher sportMatcher,
                             ApplicationEventPublisher eventPublisher) {
@@ -177,7 +179,7 @@ public class IngestionService {
                         rawEvent.getExternalId(),
                         bookmakerCode);
 
-                Long internalEventId = findOrCreateInternalEvent(rawEvent, bookmakerCode);
+                Long internalEventId = findOrCreateEvent(rawEvent, bookmakerCode);
 
                 if (internalEventId == null) {
                     log.warn("Could not find or create internal event for external ID: {}. Skipping markets.", rawEvent.getExternalId());
@@ -253,109 +255,109 @@ public class IngestionService {
         }
     }
 
-    private Long findOrCreateInternalEvent(RawEvent rawEvent, String bookmakerCode) {
-        // Проверяем, не слишком ли старое событие (например, старше 2 часов)
-        LocalDateTime now = LocalDateTime.now();
-        if (rawEvent.getStartTime().isBefore(now.minusHours(2))) {
-            log.debug("Skipping old event: {} vs {} (start time: {})",
-                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getStartTime());
-            return null;
-        }
-
-        Optional<EventExternalRefsRecord> existingRefOpt = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
-                .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(
-                        dsl.select(Tables.BOOKMAKERS.ID).from(Tables.BOOKMAKERS).where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode)).limit(1)
-                ))
-                .and(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID.eq(rawEvent.getExternalId()))
-                .fetchOptional();
-
-        if (existingRefOpt.isPresent()) {
-            Long eventId = existingRefOpt.get().getEventId();
-            if (eventId != null) {
-                log.debug("Found existing internal event ID: {} for external ID: {}", eventId, rawEvent.getExternalId());
-                return eventId;
-            }
-        }
-
-        // Пытаемся найти существующее событие по командам и времени (в пределах 1 часа)
-        Long sportId = 1L; // football по умолчанию
-
-        Long homeTeamId = findOrCreateTeam(rawEvent.getHomeTeamName(), sportId);
-        Long awayTeamId = findOrCreateTeam(rawEvent.getAwayTeamName(), sportId);
-
-        if (homeTeamId == null || awayTeamId == null) {
-            log.warn("Could not find or create teams for event: {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-            return null;
-        }
-
-        // Ищем существующее событие с теми же командами и временем в пределах 1 часа
-        EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
-                .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
-                .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
-                .and(Tables.EVENTS.START_TIME.between(
-                        rawEvent.getStartTime().minusHours(1).atOffset(ZoneOffset.UTC),
-                        rawEvent.getStartTime().plusHours(1).atOffset(ZoneOffset.UTC)
-                ))
-                .fetchOneInto(EventsRecord.class);
-
-        if (existingEvent != null) {
-            log.debug("Found existing event by teams: {} vs {} (ID: {})",
-                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), existingEvent.getId());
-            return existingEvent.getId();
-        }
-
-        // Создаём новое событие только если оно не слишком старое и не найдено существующее
-        if (rawEvent.getStartTime().isBefore(now.minusHours(1))) {
-            log.debug("Not creating new event for old match: {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-            return null;
-        }
-
-        // Создаём новое событие
-        EventsRecord eventRecord = new EventsRecord();
-        eventRecord.setHomeTeamId(homeTeamId);
-        eventRecord.setAwayTeamId(awayTeamId);
-        eventRecord.setStartTime(rawEvent.getStartTime().atOffset(ZoneOffset.UTC));
-        eventRecord.setStatus("SCHEDULED");
-        eventRecord.setEventUrl(rawEvent.getEventUrl());
-        eventRecord.setBookmakerCode(bookmakerCode);  // <-- ВОТ ЭТА СТРОЧКА БЫЛА ОТСУТСТВОВАЛА!
-
-        EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
-                .set(eventRecord)
-                .returning(Tables.EVENTS.ID)
-                .fetchOne();
-
-        if (savedEvent == null) {
-            log.error("Failed to create new event for {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-            return null;
-        }
-
-        Long internalEventId = savedEvent.getId();
-        log.debug("Created new event ID: {} for {} vs {} (bookmaker: {})",
-                internalEventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), bookmakerCode);
-
-        // Сохраняем внешнюю ссылку
-        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
-                .from(Tables.BOOKMAKERS)
-                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
-                .limit(1)
-                .fetchOneInto(Long.class);
-
-        if (bookmakerId != null) {
-            dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
-                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, internalEventId)
-                    .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
-                    .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
-                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
-                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
-                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, rawEvent.getStartTime().atOffset(ZoneOffset.UTC))
-                    .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
-                    .doUpdate()
-                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, internalEventId)
-                    .execute();
-        }
-
-        return internalEventId;
-    }
+//    private Long findOrCreateInternalEvent(RawEvent rawEvent, String bookmakerCode) {
+//        // Проверяем, не слишком ли старое событие (например, старше 2 часов)
+//        LocalDateTime now = LocalDateTime.now();
+//        if (rawEvent.getStartTime().isBefore(now.minusHours(2))) {
+//            log.debug("Skipping old event: {} vs {} (start time: {})",
+//                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getStartTime());
+//            return null;
+//        }
+//
+//        Optional<EventExternalRefsRecord> existingRefOpt = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
+//                .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(
+//                        dsl.select(Tables.BOOKMAKERS.ID).from(Tables.BOOKMAKERS).where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode)).limit(1)
+//                ))
+//                .and(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID.eq(rawEvent.getExternalId()))
+//                .fetchOptional();
+//
+//        if (existingRefOpt.isPresent()) {
+//            Long eventId = existingRefOpt.get().getEventId();
+//            if (eventId != null) {
+//                log.debug("Found existing internal event ID: {} for external ID: {}", eventId, rawEvent.getExternalId());
+//                return eventId;
+//            }
+//        }
+//
+//        // Пытаемся найти существующее событие по командам и времени (в пределах 1 часа)
+//        Long sportId = 1L; // football по умолчанию
+//
+//        Long homeTeamId = findOrCreateTeam(rawEvent.getHomeTeamName(), sportId);
+//        Long awayTeamId = findOrCreateTeam(rawEvent.getAwayTeamName(), sportId);
+//
+//        if (homeTeamId == null || awayTeamId == null) {
+//            log.warn("Could not find or create teams for event: {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+//            return null;
+//        }
+//
+//        // Ищем существующее событие с теми же командами и временем в пределах 1 часа
+//        EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
+//                .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
+//                .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
+//                .and(Tables.EVENTS.START_TIME.between(
+//                        rawEvent.getStartTime().minusHours(1).atOffset(ZoneOffset.UTC),
+//                        rawEvent.getStartTime().plusHours(1).atOffset(ZoneOffset.UTC)
+//                ))
+//                .fetchOneInto(EventsRecord.class);
+//
+//        if (existingEvent != null) {
+//            log.debug("Found existing event by teams: {} vs {} (ID: {})",
+//                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), existingEvent.getId());
+//            return existingEvent.getId();
+//        }
+//
+//        // Создаём новое событие только если оно не слишком старое и не найдено существующее
+//        if (rawEvent.getStartTime().isBefore(now.minusHours(1))) {
+//            log.debug("Not creating new event for old match: {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+//            return null;
+//        }
+//
+//        // Создаём новое событие
+//        EventsRecord eventRecord = new EventsRecord();
+//        eventRecord.setHomeTeamId(homeTeamId);
+//        eventRecord.setAwayTeamId(awayTeamId);
+//        eventRecord.setStartTime(rawEvent.getStartTime().atOffset(ZoneOffset.UTC));
+//        eventRecord.setStatus("SCHEDULED");
+//        eventRecord.setEventUrl(rawEvent.getEventUrl());
+//        eventRecord.setBookmakerCode(bookmakerCode);  // <-- ВОТ ЭТА СТРОЧКА БЫЛА ОТСУТСТВОВАЛА!
+//
+//        EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
+//                .set(eventRecord)
+//                .returning(Tables.EVENTS.ID)
+//                .fetchOne();
+//
+//        if (savedEvent == null) {
+//            log.error("Failed to create new event for {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+//            return null;
+//        }
+//
+//        Long internalEventId = savedEvent.getId();
+//        log.debug("Created new event ID: {} for {} vs {} (bookmaker: {})",
+//                internalEventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), bookmakerCode);
+//
+//        // Сохраняем внешнюю ссылку
+//        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+//                .from(Tables.BOOKMAKERS)
+//                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+//                .limit(1)
+//                .fetchOneInto(Long.class);
+//
+//        if (bookmakerId != null) {
+//            dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
+//                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, internalEventId)
+//                    .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
+//                    .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
+//                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
+//                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
+//                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, rawEvent.getStartTime().atOffset(ZoneOffset.UTC))
+//                    .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
+//                    .doUpdate()
+//                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, internalEventId)
+//                    .execute();
+//        }
+//
+//        return internalEventId;
+//    }
 
 
     private Long findOrCreateTeam(String teamName, Long sportId) {
@@ -424,4 +426,364 @@ public class IngestionService {
         }
         log.info("=======================");
     }
+
+    /**
+     * Находит существующее каноническое событие по сырым данным с матчингом (включая лиги)
+     */
+    private Long findCanonicalEventId(RawEvent rawEvent, String bookmakerCode) {
+        log.info("🔍 Матчинг события: {} vs {} [{}] от {}",
+                rawEvent.getHomeTeamName(),
+                rawEvent.getAwayTeamName(),
+                rawEvent.getLeagueName(),
+                bookmakerCode);
+
+        // 1. Проверяем, есть ли уже внешняя ссылка для этого БК
+        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+                .from(Tables.BOOKMAKERS)
+                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+                .fetchOneInto(Long.class);
+
+        if (bookmakerId == null) return null;
+
+        // Проверяем существующую внешнюю ссылку
+        EventExternalRefsRecord existingRef = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
+                .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(bookmakerId))
+                .and(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID.eq(rawEvent.getExternalId()))
+                .fetchOne();
+
+        if (existingRef != null && existingRef.getEventId() != null) {
+            log.debug("Найдена существующая внешняя ссылка для события ID: {}", existingRef.getEventId());
+            return existingRef.getEventId();
+        }
+
+        // 2. Ищем похожие события через EventMatcherService с учётом времени (±2 часа)
+        OffsetDateTime startTimeUtc = rawEvent.getStartTime().atOffset(ZoneOffset.UTC);
+
+        List<EventsRecord> candidateEvents = dsl.selectFrom(Tables.EVENTS)
+                .where(Tables.EVENTS.START_TIME.between(
+                        startTimeUtc.minusHours(2),
+                        startTimeUtc.plusHours(2)
+                ))
+                .and(Tables.EVENTS.STATUS.eq("SCHEDULED"))
+                .fetch();
+
+        EventMatcherService matcher = new EventMatcherService();
+
+        for (EventsRecord candidate : candidateEvents) {
+            // Получаем команды кандидата
+            TeamsRecord homeTeam = dsl.selectFrom(Tables.TEAMS)
+                    .where(Tables.TEAMS.ID.eq(candidate.getHomeTeamId()))
+                    .fetchOne();
+            TeamsRecord awayTeam = dsl.selectFrom(Tables.TEAMS)
+                    .where(Tables.TEAMS.ID.eq(candidate.getAwayTeamId()))
+                    .fetchOne();
+
+            if (homeTeam == null || awayTeam == null) continue;
+
+            // Получаем лигу кандидата
+            String candidateLeague = null;
+            if (candidate.getLeagueId() != null) {
+                LeaguesRecord league = dsl.selectFrom(Tables.LEAGUES)
+                        .where(Tables.LEAGUES.ID.eq(candidate.getLeagueId()))
+                        .fetchOne();
+                if (league != null) {
+                    candidateLeague = league.getName();
+                }
+            }
+
+            // Сравниваем через матчер (с учётом лиг!)
+            if (matcher.isSameEvent(
+                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName(),
+                    homeTeam.getCanonicalName(), awayTeam.getCanonicalName(), candidateLeague)) {
+
+                log.info("✅ Сматчено событие: {} vs {} [{}] → существующее событие ID: {}",
+                        rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName(),
+                        candidate.getId());
+
+                // Сохраняем внешнюю ссылку
+                if (existingRef == null) {
+                    dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
+                            .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, candidate.getId())
+                            .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
+                            .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
+                            .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
+                            .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
+                            .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, startTimeUtc)
+                            .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
+                            .doUpdate()
+                            .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, candidate.getId())
+                            .execute();
+                }
+
+                return candidate.getId();
+            }
+        }
+
+//        // ВРЕМЕННО: не создаём новые события
+//        log.warn("⚠️ ВРЕМЕННО: Не создаём новое событие для {} vs {}, пропускаем",
+//                rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+//        return null;
+
+//        // 3. Не нашли — создаём новое событие
+//        log.info("🆕 Событие не найдено, создаём новое: {} vs {} [{}]",
+//                rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
+//        // В конце, если не нашли:
+        log.info("🆕 Событие не найдено, создаём новое: {} vs {} [{}]",
+                rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
+        return createNewEvent(rawEvent, bookmakerCode);
+    }
+
+    /**
+     * Создаёт новое каноническое событие (с лигой)
+     */
+    private Long createNewEvent(RawEvent rawEvent, String bookmakerCode) {
+        Long sportId = 1L; // football по умолчанию
+
+        // 1. Создаём или находим команды
+        Long homeTeamId = findOrCreateTeamWithNormalization(rawEvent.getHomeTeamName(), sportId, bookmakerCode);
+        Long awayTeamId = findOrCreateTeamWithNormalization(rawEvent.getAwayTeamName(), sportId, bookmakerCode);
+
+        if (homeTeamId == null || awayTeamId == null) {
+            log.warn("Не удалось создать команды для {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+            return null;
+        }
+
+        // 2. Создаём или находим лигу
+        Long leagueId = findOrCreateLeague(rawEvent.getLeagueName(), sportId);
+
+        // 3. Создаём событие
+        EventsRecord eventRecord = new EventsRecord();
+        eventRecord.setHomeTeamId(homeTeamId);
+        eventRecord.setAwayTeamId(awayTeamId);
+        eventRecord.setLeagueId(leagueId);
+        eventRecord.setStartTime(rawEvent.getStartTime().atOffset(ZoneOffset.UTC));
+        eventRecord.setStatus("SCHEDULED");
+        eventRecord.setEventUrl(rawEvent.getEventUrl());
+        eventRecord.setBookmakerCode(bookmakerCode);
+
+        EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
+                .set(eventRecord)
+                .returning(Tables.EVENTS.ID)
+                .fetchOne();
+
+        if (savedEvent == null) return null;
+
+        Long eventId = savedEvent.getId();
+        log.info("✅ Создано новое событие ID: {} для {} vs {} [{}]",
+                eventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
+
+        // 4. Сохраняем внешнюю ссылку
+        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+                .from(Tables.BOOKMAKERS)
+                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+                .fetchOneInto(Long.class);
+
+        if (bookmakerId != null) {
+            dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
+                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, eventId)
+                    .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
+                    .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
+                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
+                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
+                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, rawEvent.getStartTime().atOffset(ZoneOffset.UTC))
+                    .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
+                    .doUpdate()
+                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, eventId)
+                    .execute();
+        }
+
+        return eventId;
+    }
+
+    private Long findOrCreateEvent(RawEvent rawEvent, String bookmakerCode) {
+        Long sportId = 1L; // football по умолчанию
+
+        // 1. Создаём или находим команды
+        Long homeTeamId = findOrCreateTeamWithNormalization(rawEvent.getHomeTeamName(), sportId, bookmakerCode);
+        Long awayTeamId = findOrCreateTeamWithNormalization(rawEvent.getAwayTeamName(), sportId, bookmakerCode);
+
+        if (homeTeamId == null || awayTeamId == null) {
+            log.warn("Не удалось создать команды для {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
+            return null;
+        }
+
+        // 2. Создаём или находим лигу
+        Long leagueId = findOrCreateLeague(rawEvent.getLeagueName(), sportId);
+
+        // ===== НОВАЯ ПРОВЕРКА: ищем существующее событие =====
+        OffsetDateTime startTimeUtc = rawEvent.getStartTime().atOffset(ZoneOffset.UTC);
+
+        EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
+                .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
+                .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
+                .and(Tables.EVENTS.START_TIME.between(
+                        startTimeUtc.minusHours(2),
+                        startTimeUtc.plusHours(2)
+                ))
+                .fetchOne();
+
+        if (existingEvent != null) {
+            log.info("♻️ Найдено существующее событие ID: {} для {} vs {} [{}], обновляем ссылку",
+                    existingEvent.getId(), rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
+
+            // Обновляем внешнюю ссылку для этого БК
+            Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+                    .from(Tables.BOOKMAKERS)
+                    .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+                    .fetchOneInto(Long.class);
+
+            if (bookmakerId != null) {
+                dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
+                        .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, existingEvent.getId())
+                        .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
+                        .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
+                        .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
+                        .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
+                        .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, startTimeUtc)
+                        .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
+                        .doUpdate()
+                        .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, existingEvent.getId())
+                        .execute();
+            }
+
+            return existingEvent.getId();
+        }
+
+        // ===== Создаём новое событие (только если не нашли существующее) =====
+        EventsRecord eventRecord = new EventsRecord();
+        eventRecord.setHomeTeamId(homeTeamId);
+        eventRecord.setAwayTeamId(awayTeamId);
+        eventRecord.setLeagueId(leagueId);
+        eventRecord.setStartTime(startTimeUtc);
+        eventRecord.setStatus("SCHEDULED");
+        eventRecord.setEventUrl(rawEvent.getEventUrl());
+        eventRecord.setBookmakerCode(bookmakerCode);
+
+        EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
+                .set(eventRecord)
+                .returning(Tables.EVENTS.ID)
+                .fetchOne();
+
+        if (savedEvent == null) return null;
+
+        Long eventId = savedEvent.getId();
+        log.info("✅ Создано новое событие ID: {} для {} vs {} [{}]",
+                eventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
+
+        // Сохраняем внешнюю ссылку
+        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+                .from(Tables.BOOKMAKERS)
+                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+                .fetchOneInto(Long.class);
+
+        if (bookmakerId != null) {
+            dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
+                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, eventId)
+                    .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
+                    .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
+                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
+                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
+                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, startTimeUtc)
+                    .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
+                    .doUpdate()
+                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, eventId)
+                    .execute();
+        }
+
+        return eventId;
+    }
+
+    /**
+     * Находит или создаёт лигу
+     */
+    /**
+     * Находит или создаёт лигу
+     */
+    private Long findOrCreateLeague(String leagueName, Long sportId) {
+        if (leagueName == null || leagueName.isEmpty() || "Unknown League".equals(leagueName)) {
+            return null; // лига не обязательна
+        }
+
+        // Нормализуем название лиги для поиска
+        String normalizedLeagueName = leagueName.trim().toLowerCase();
+
+        // Ищем существующую лигу
+        LeaguesRecord existingLeague = dsl.selectFrom(Tables.LEAGUES)
+                .where(Tables.LEAGUES.NAME.likeIgnoreCase(normalizedLeagueName))
+                .and(Tables.LEAGUES.SPORT_ID.eq(sportId))
+                .fetchOne();
+
+        if (existingLeague != null) {
+            return existingLeague.getId();
+        }
+
+        // Создаём новую лигу
+        LeaguesRecord newLeague = new LeaguesRecord();
+        newLeague.setName(leagueName);
+        newLeague.setSportId(sportId);
+
+        LeaguesRecord savedLeague = dsl.insertInto(Tables.LEAGUES)
+                .set(newLeague)
+                .returning(Tables.LEAGUES.ID)
+                .fetchOne();
+
+        log.debug("Создана новая лига: {} (ID: {})", leagueName, savedLeague.getId());
+        return savedLeague.getId();
+    }
+
+    /**
+     * Находит или создаёт команду с нормализацией через TeamMatcher
+     */
+    private Long findOrCreateTeamWithNormalization(String teamName, Long sportId, String bookmakerCode) {
+        if (teamName == null || teamName.isEmpty() || "TBD".equals(teamName)) {
+            return null;
+        }
+
+        // 1. Сначала ищем через алиасы (точное совпадение у конкретного БК)
+        Optional<TeamsRecord> byAlias = teamMatcher.findCanonicalTeamByAliasAndBookmaker(teamName, bookmakerCode);
+        if (byAlias.isPresent()) {
+            log.debug("Команда найдена по алиасу: {} → ID: {}", teamName, byAlias.get().getId());
+            return byAlias.get().getId();
+        }
+
+        // 2. Нормализуем имя и ищем
+        String normalized = teamMatcher.normalizeTeamName(teamName);
+        Optional<TeamsRecord> byNormalized = teamMatcher.findCanonicalTeam(normalized);
+        if (byNormalized.isPresent()) {
+            // Создаём алиас для будущих раз
+            createTeamAlias(byNormalized.get().getId(), bookmakerCode, teamName);
+            log.debug("Команда найдена по нормализации: {} → ID: {}", teamName, byNormalized.get().getId());
+            return byNormalized.get().getId();
+        }
+
+        // 3. Создаём новую команду
+        TeamsRecord newTeam = teamMatcher.createCanonicalTeam(teamName, sportId);
+
+        // Создаём алиас
+        createTeamAlias(newTeam.getId(), bookmakerCode, teamName);
+
+        log.info("Создана новая команда: {} (ID: {})", teamName, newTeam.getId());
+        return newTeam.getId();
+    }
+
+    /**
+     * Создаёт алиас команды для букмекера
+     */
+    private void createTeamAlias(Long teamId, String bookmakerCode, String alias) {
+        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+                .from(Tables.BOOKMAKERS)
+                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+                .fetchOneInto(Long.class);
+
+        if (bookmakerId == null) return;
+
+        dsl.insertInto(Tables.TEAM_ALIASES)
+                .set(Tables.TEAM_ALIASES.TEAM_ID, teamId)
+                .set(Tables.TEAM_ALIASES.BOOKMAKER_ID, bookmakerId)
+                .set(Tables.TEAM_ALIASES.ALIAS, alias)
+                .onConflict(Tables.TEAM_ALIASES.TEAM_ID, Tables.TEAM_ALIASES.BOOKMAKER_ID, Tables.TEAM_ALIASES.ALIAS)
+                .doNothing()
+                .execute();
+    }
+
 }
