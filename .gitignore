@@ -2,8 +2,9 @@
 target/
 **/target/
 
-# jOOQ generated sources
-src/main/java/com/oddscanner/generated/
+# jOOQ generated sources (добавить оба варианта)
+target/generated-sources/
+**/generated/
 
 # Compiled class files
 **/*.class
@@ -12,7 +13,17 @@ src/main/java/com/oddscanner/generated/
 *.jar
 *.war
 
-# IDE files (на всякий случай)
+# IDE files
 .idea/
 *.iml
 .DS_Store
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Local configs
+application-local.yml
+application-*.yml
+!application-default.yml
