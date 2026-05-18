@@ -23,6 +23,7 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
+import java.time.Duration;
 
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
@@ -179,6 +180,13 @@ public class IngestionService {
                     bookmakerCode.toUpperCase(), rawEvents.size(), newEvents, updatedEvents, totalTime / 1000);
 
             eventPublisher.publishEvent(new OddsUpdatedEvent(bookmakerCode, null));
+
+            // Очистка устаревших событий (используем refresh_seconds из БД, дефолт 300 секунд = 5 минут)
+            Integer refreshSeconds = bookmaker.getRefreshSeconds();
+            if (refreshSeconds == null || refreshSeconds <= 0) {
+                refreshSeconds = 300; // значение по умолчанию
+            }
+            cleanupOrphanedEvents(bookmaker.getId(), refreshSeconds);
 
         } catch (Exception e) {
             log.error("{}: {}", bookmakerCode, e.getMessage());
@@ -778,5 +786,109 @@ public class IngestionService {
                 .doNothing()
                 .execute();
     }
+
+    /**
+     * Очищает устаревшие ссылки на события для указанного букмекера
+     * @param bookmakerId ID букмекера
+     * @param refreshSeconds интервал обновления в секундах (из настроек БК)
+     */
+    /**
+     * Очищает устаревшие ссылки на события для указанного букмекера
+     * @param bookmakerId ID букмекера
+     * @param refreshSeconds интервал обновления в секундах (из настроек БК)
+     */
+    private void cleanupOrphanedEvents(Long bookmakerId, int refreshSeconds) {
+        log.debug("Starting cleanup of orphaned events for bookmaker ID: {}", bookmakerId);
+
+        // Порог: если событие не обновлялось дольше, чем 2 цикла парсинга
+        Duration staleThreshold = Duration.ofSeconds(refreshSeconds * 2L);
+        OffsetDateTime cutoffTime = OffsetDateTime.now(ZoneOffset.UTC).minus(staleThreshold);
+
+        // Находим устаревшие external_refs для этого БК
+        var staleRefs = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
+                .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(bookmakerId))
+                .and(Tables.EVENT_EXTERNAL_REFS.LAST_SEEN_AT.lessThan(cutoffTime))
+                .fetch();
+
+        if (staleRefs.isEmpty()) {
+            log.debug("No stale references found for bookmaker ID: {}", bookmakerId);
+            return;
+        }
+
+        log.info("Found {} stale references for bookmaker ID: {}", staleRefs.size(), bookmakerId);
+
+        for (var staleRef : staleRefs) {
+            Long eventId = staleRef.getEventId();
+            String externalId = staleRef.getExternalId();
+            OffsetDateTime lastSeen = staleRef.getLastSeenAt();
+
+            log.warn("Cleaning up stale reference: bookmaker_id={}, external_id={}, event_id={}, last_seen={}",
+                    bookmakerId, externalId, eventId, lastSeen);
+
+            if (eventId == null) {
+                // Если event_id не привязан — просто удаляем ссылку
+                dsl.deleteFrom(Tables.EVENT_EXTERNAL_REFS)
+                        .where(Tables.EVENT_EXTERNAL_REFS.ID.eq(staleRef.getId()))
+                        .execute();
+                log.debug("Deleted unlinked external_ref with id={}", staleRef.getId());
+                continue;
+            }
+
+            // Проверяем, есть ли у этого события другие активные букмекеры
+            int otherBookmakersCount = dsl.fetchCount(
+                    dsl.selectDistinct(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID)
+                            .from(Tables.EVENT_EXTERNAL_REFS)
+                            .where(Tables.EVENT_EXTERNAL_REFS.EVENT_ID.eq(eventId))
+                            .and(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.ne(bookmakerId))
+            );
+
+            if (otherBookmakersCount == 0) {
+                // Событие больше не нужно — удаляем каскадно
+                log.info("Event {} has no other bookmakers, deleting completely", eventId);
+                deleteEventCascade(eventId);
+            } else {
+                // Удаляем только устаревшую ссылку этого БК
+                dsl.deleteFrom(Tables.EVENT_EXTERNAL_REFS)
+                        .where(Tables.EVENT_EXTERNAL_REFS.ID.eq(staleRef.getId()))
+                        .execute();
+                log.debug("Removed stale reference for event {} (other bookmakers exist)", eventId);
+            }
+        }
+    }
+
+    /**
+     * Каскадное удаление события и всех связанных данных
+     * @param eventId ID события
+     */
+    private void deleteEventCascade(Long eventId) {
+        // 1. Удаляем исходы (outcomes) через рынки (markets)
+        dsl.deleteFrom(Tables.OUTCOMES)
+                .where(Tables.OUTCOMES.MARKET_ID.in(
+                        dsl.select(Tables.MARKETS.ID)
+                                .from(Tables.MARKETS)
+                                .where(Tables.MARKETS.EVENT_ID.eq(eventId))
+                ))
+                .execute();
+
+        // 2. Удаляем рынки (markets)
+        dsl.deleteFrom(Tables.MARKETS)
+                .where(Tables.MARKETS.EVENT_ID.eq(eventId))
+                .execute();
+
+        // 3. Удаляем внешние ссылки (event_external_refs)
+        dsl.deleteFrom(Tables.EVENT_EXTERNAL_REFS)
+                .where(Tables.EVENT_EXTERNAL_REFS.EVENT_ID.eq(eventId))
+                .execute();
+
+        // 4. Помечаем событие как FINISHED (вместо удаления, чтобы сохранить историю)
+        dsl.update(Tables.EVENTS)
+                .set(Tables.EVENTS.STATUS, "FINISHED")
+                .where(Tables.EVENTS.ID.eq(eventId))
+                .execute();
+
+        log.info("Event {} marked as FINISHED and all related data cleaned up", eventId);
+    }
+
+
 
 }
