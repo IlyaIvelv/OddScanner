@@ -13,6 +13,7 @@ import com.oddscanner.bookmaker.api.RawMarket;
 import com.oddscanner.bookmaker.api.RawOutcome;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 import java.io.ByteArrayInputStream;
@@ -27,6 +28,7 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Component
+@Order(2)
 public class FonbetAdapter implements BookmakerAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(FonbetAdapter.class);
@@ -158,7 +160,7 @@ public class FonbetAdapter implements BookmakerAdapter {
         SPORT_MAPPING.put(20281, "Американский футбол");
     }
 
-    // ==================== МАППИНГ ID → НАЗВАНИЕ ЛИГИ ====================
+    // ==================== СТАТИЧЕСКИЙ МАППИНГ ID → НАЗВАНИЕ ЛИГИ (ДЛЯ ИЗВЕСТНЫХ) ====================
     private static final Map<Integer, String> LEAGUE_MAPPING = new HashMap<>();
 
     static {
@@ -215,14 +217,16 @@ public class FonbetAdapter implements BookmakerAdapter {
     private final ObjectMapper mapper = new ObjectMapper();
 
     private final Map<String, List<RawMarket>> marketsCache = new HashMap<>();
-    private final Map<Integer, String> leagueCache = new ConcurrentHashMap<>();
     private final Map<String, String> teamCache = new ConcurrentHashMap<>();
+
+    private final Map<Integer, String> dynamicLeagueCache = new ConcurrentHashMap<>();
+    private boolean leagueCacheLoaded = false;
 
     private String cachedApiBaseUrl = null;
     private long lastApiBaseUrlFetch = 0;
     private String cachedApiHost = null;
 
-    private boolean debugLogged = false;  // ДЛЯ ДЕБАГА
+    private boolean debugLogged = false;
 
     @Override
     public String code() {
@@ -244,7 +248,11 @@ public class FonbetAdapter implements BookmakerAdapter {
             }
 
             String apiUrl = apiBaseUrl + "/ma/events/list?lang=ru&scopeMarket=1600&version=" + System.currentTimeMillis();
-            log.info("API URL: {}", apiUrl);
+
+            if (!debugLogged) {
+                log.info("API URL получен");
+                debugLogged = true;
+            }
 
             String response = fetchApiData(apiUrl);
             if (response == null) {
@@ -267,75 +275,43 @@ public class FonbetAdapter implements BookmakerAdapter {
         return marketsCache.getOrDefault(externalEventId, new ArrayList<>());
     }
 
-    // ==================== ОСНОВНОЙ МЕТОД ОПРЕДЕЛЕНИЯ ЛИГИ (С ДЕБАГОМ) ====================
     private String resolveLeagueName(JsonNode eventNode) {
         Integer sportId = getIntField(eventNode, "sportId");
         String eventName = getStringField(eventNode, "name", "title", "eventName");
 
-        // Сначала проверяем, есть ли у нас прямой маппинг для sportId
-        if (sportId != null && SPORT_MAPPING.containsKey(sportId)) {
-            String mappedSport = SPORT_MAPPING.get(sportId);
-            // Для киберспорта возвращаем сразу
-            if (mappedSport.equals("Киберспорт") || mappedSport.equals("Виртуальный спорт")) {
-                return mappedSport;
-            }
+        if (sportId != null && dynamicLeagueCache.containsKey(sportId)) {
+            return dynamicLeagueCache.get(sportId);
         }
 
-        // ПРОБУЕМ ИЗВЛЕЧЬ ЛИГУ ИЗ ПОЛЯ "name"
+        if (sportId != null && LEAGUE_MAPPING.containsKey(sportId)) {
+            return LEAGUE_MAPPING.get(sportId);
+        }
+
         if (eventName != null && !eventName.isEmpty() && !"null".equalsIgnoreCase(eventName)) {
             String[] separators = {" - ", " – ", " : ", " vs "};
-            String leagueFromName = null;
-
             for (String sep : separators) {
                 int idx = eventName.indexOf(sep);
                 if (idx > 0) {
-                    leagueFromName = eventName.substring(0, idx).trim();
-                    break;
-                }
-            }
-
-            if (leagueFromName != null) {
-                if (leagueFromName.contains(".") ||
-                        leagueFromName.endsWith("Лига") ||
-                        leagueFromName.endsWith("League") ||
-                        leagueFromName.contains("Кубок") ||
-                        leagueFromName.contains("Чемпионат")) {
-                    log.debug("Лига из названия события: '{}'", leagueFromName);
-                    return leagueFromName;
-                }
-            }
-
-            if (eventName.contains(" vs ")) {
-                String[] parts = eventName.split(" vs ");
-                if (parts.length >= 1 && parts[0].contains(".")) {
-                    log.debug("Лига из названия (by vs): '{}'", parts[0].trim());
-                    return parts[0].trim();
-                }
-            }
-
-            if (eventName.contains(" - ")) {
-                String[] parts = eventName.split(" - ");
-                if (parts.length >= 1 && parts[0].contains(".")) {
-                    log.debug("Лига из названия (by -): '{}'", parts[0].trim());
-                    return parts[0].trim();
+                    String leagueFromName = eventName.substring(0, idx).trim();
+                    if (leagueFromName.contains(".") ||
+                            leagueFromName.endsWith("Лига") ||
+                            leagueFromName.endsWith("League") ||
+                            leagueFromName.contains("Кубок") ||
+                            leagueFromName.contains("Чемпионат")) {
+                        return leagueFromName;
+                    }
                 }
             }
         }
 
-        // ЕСЛИ НЕ НАШЛИ - ИСПОЛЬЗУЕМ MAPPING SPORT ID
-        String sportName = getSportName(eventNode);
         if (sportId != null && SPORT_MAPPING.containsKey(sportId)) {
             return SPORT_MAPPING.get(sportId);
         }
 
         String homeTeam = getStringField(eventNode, "team1", "homeTeam", "home");
         String awayTeam = getStringField(eventNode, "team2", "awayTeam", "away");
-        if (homeTeam != null && awayTeam != null) {
-            log.debug("Событие без названия лиги: {} vs {}", homeTeam, awayTeam);
-        }
 
-        log.warn("❌ Не удалось определить лигу для события. sportId: {}, name: '{}'", sportId, eventName);
-        return "Неизвестная лига (" + sportName + ")";
+        return "Неизвестная лига";
     }
 
     private String getSportName(JsonNode eventNode) {
@@ -349,18 +325,11 @@ public class FonbetAdapter implements BookmakerAdapter {
                 case 5: return "Волейбол";
                 case 6: return "MMA/Бокс";
                 case 7: return "Киберспорт";
-                case 110368: return "Виртуальный спорт";
-                case 129372: return "Виртуальный спорт";
-                case 129373: return "Виртуальный спорт";
-                case 141934: return "Киберспорт";
-                case 141803: return "Гандбол";
                 default: return "Спорт " + sportId;
             }
         }
         return "Unknown Sport";
     }
-
-    // ==================== ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ ====================
 
     private Integer getIntField(JsonNode node, String... fieldNames) {
         if (node == null) return null;
@@ -391,8 +360,6 @@ public class FonbetAdapter implements BookmakerAdapter {
         if (cachedApiBaseUrl != null && System.currentTimeMillis() - lastApiBaseUrlFetch < 300000) {
             return cachedApiBaseUrl;
         }
-
-        log.info("Обнаружение API базового URL...");
 
         try (Playwright playwright = Playwright.create()) {
             Browser browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
@@ -430,7 +397,6 @@ public class FonbetAdapter implements BookmakerAdapter {
                 lastApiBaseUrlFetch = System.currentTimeMillis();
                 page.close();
                 browser.close();
-                log.info("API базовый URL обнаружен: {}", cachedApiBaseUrl);
                 return cachedApiBaseUrl;
             }
 
@@ -438,7 +404,7 @@ public class FonbetAdapter implements BookmakerAdapter {
             browser.close();
 
         } catch (Exception e) {
-            log.error("Ошибка при обнаружении API URL: {}", e.getMessage(), e);
+            log.error("Ошибка при обнаружении API URL: {}", e.getMessage());
         }
 
         return null;
@@ -453,8 +419,6 @@ public class FonbetAdapter implements BookmakerAdapter {
     }
 
     private String fetchApiData(String url) throws IOException, InterruptedException {
-        log.debug("Запрос к API: {}", url);
-
         HttpRequest request = HttpRequest.newBuilder()
                 .uri(URI.create(url))
                 .header("Accept", "*/*")
@@ -477,7 +441,6 @@ public class FonbetAdapter implements BookmakerAdapter {
             return new String(body, java.nio.charset.StandardCharsets.UTF_8);
         }
 
-        log.warn("API запрос вернул статус: {}", response.statusCode());
         return null;
     }
 
@@ -486,6 +449,14 @@ public class FonbetAdapter implements BookmakerAdapter {
 
         try {
             JsonNode root = mapper.readTree(jsonResponse);
+
+            if (!leagueCacheLoaded) {
+                Map<Integer, String> freshMapping = buildLeagueMapping(root);
+                dynamicLeagueCache.putAll(freshMapping);
+                leagueCacheLoaded = true;
+                log.info("Загружено {} лиг из справочника", dynamicLeagueCache.size());
+            }
+
             JsonNode eventsNode = findEventsNode(root);
 
             if (eventsNode == null || !eventsNode.isArray()) {
@@ -493,18 +464,22 @@ public class FonbetAdapter implements BookmakerAdapter {
                 return events;
             }
 
-            log.info("Найдено {} событий в ответе API", eventsNode.size());
+            if (!debugLogged) {
+                log.info("Найдено {} событий в ответе API", eventsNode.size());
+            }
 
             for (JsonNode eventNode : eventsNode) {
                 try {
+                    if (eventNode.has("level") && eventNode.get("level").asInt() != 1) {
+                        continue;
+                    }
+
                     RawEvent event = parseEventNode(eventNode);
                     if (event != null && event.getHomeTeamName() != null && event.getAwayTeamName() != null) {
                         events.add(event);
-                        log.debug("Добавлено: {} vs {} [{}]",
-                                event.getHomeTeamName(), event.getAwayTeamName(), event.getLeagueName());
                     }
                 } catch (Exception e) {
-                    log.debug("Ошибка парсинга события: {}", e.getMessage());
+                    // Подавляем лог для единичных ошибок
                 }
             }
 
@@ -608,7 +583,7 @@ public class FonbetAdapter implements BookmakerAdapter {
             try {
                 return LocalDateTime.parse(timeStr);
             } catch (Exception e) {
-                log.debug("Не удалось распарсить время: {}", timeStr);
+                // Подавляем
             }
         }
         return null;
@@ -715,7 +690,7 @@ public class FonbetAdapter implements BookmakerAdapter {
                 try {
                     odds = new BigDecimal(oddsNode.asText().replace(",", "."));
                 } catch (Exception e) {
-                    log.debug("Не удалось распарсить коэффициент: {}", oddsNode.asText());
+                    // Подавляем
                 }
             }
         }
@@ -775,7 +750,19 @@ public class FonbetAdapter implements BookmakerAdapter {
         }
     }
 
-    private void debugEventStructure(JsonNode eventNode, String eventId, String homeTeam, String awayTeam) {
-        // Метод оставлен для обратной совместимости, но не используется
+    private Map<Integer, String> buildLeagueMapping(JsonNode response) {
+        Map<Integer, String> leagueMap = new HashMap<>();
+        JsonNode sportsArray = response.get("sports");
+
+        if (sportsArray != null && sportsArray.isArray()) {
+            for (JsonNode sportNode : sportsArray) {
+                if (sportNode.has("kind") && "segment".equals(sportNode.get("kind").asText())) {
+                    int leagueId = sportNode.get("id").asInt();
+                    String leagueName = sportNode.get("name").asText();
+                    leagueMap.put(leagueId, leagueName);
+                }
+            }
+        }
+        return leagueMap;
     }
 }

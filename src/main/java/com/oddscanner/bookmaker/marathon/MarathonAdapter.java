@@ -8,6 +8,7 @@ import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.LoadState;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
@@ -17,373 +18,354 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 @Component
+@Order(1)
 public class MarathonAdapter implements BookmakerAdapter {
     private static final Logger log = LoggerFactory.getLogger(MarathonAdapter.class);
     private static final String BASE_URL = "https://www.marathonbet.ru";
-    private static final String FOOTBALL_URL = "/su/betting/Football/";
+
+    // Расширенный список лиг
+    private static final List<String> FOOTBALL_URLS = Arrays.asList(
+            // Топ-5 лиг
+            "/su/betting/Football/England/Premier-League/",
+            "/su/betting/Football/Spain/Primera-Division/",
+            "/su/betting/Football/Italy/Serie-A/",
+            "/su/betting/Football/Germany/Bundesliga/",
+            "/su/betting/Football/France/Ligue-1/",
+
+            // Россия и Европа
+            "/su/betting/Football/Russia/Premier-League/",
+            "/su/betting/Football/Portugal/Primeira-Liga/",
+            "/su/betting/Football/Netherlands/Eredivisie/",
+            "/su/betting/Football/Turkey/Super-Lig/",
+            "/su/betting/Football/Belgium/Pro-League/",
+
+            // Южная Америка
+            "/su/betting/Football/Brazil/Serie-A/",
+            "/su/betting/Football/Argentina/Professional-Cup/",
+
+            // Азия
+            "/su/betting/Football/Japan/J1-League/",
+            "/su/betting/Football/South-Korea/K-League-1/",
+            "/su/betting/Football/China/CSL/",
+
+            // Европейские кубки и сборные
+            "/su/betting/Football/UEFA-Champions-League/",
+            "/su/betting/Football/UEFA-Europa-League/",
+            "/su/betting/Football/UEFA-Conference-League/",
+            "/su/betting/Football/UEFA-Nations-League/",
+
+            // Чемпионаты мира и Европы
+            "/su/betting/Football/World-Cup/",
+            "/su/betting/Football/European-Championship/",
+
+            // Другие европейские лиги
+            "/su/betting/Football/Poland/Ekstraklasa/",
+            "/su/betting/Football/Czech-Republic/1-Liga/",
+            "/su/betting/Football/Greece/Super-League/",
+            "/su/betting/Football/Scotland/Premiership/",
+            "/su/betting/Football/Switzerland/Super-League/",
+            "/su/betting/Football/Austria/Bundesliga/"
+    );
 
     private final Map<String, List<RawMarket>> marketsCache = new HashMap<>();
 
-    public MarathonAdapter() {}
+    private static final List<String> USER_AGENTS = Arrays.asList(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+    );
 
     @Override
     public String code() {
         return "marathon";
     }
 
-
     @Override
     public List<RawEvent> fetchEvents() {
         log.info("=== MARATHON fetchEvents() START ===");
-        log.info("=== НАЧАЛО ПАРСИНГА MARATHON ===");
+        List<RawEvent> allEvents = new ArrayList<>();
 
+        for (String url : FOOTBALL_URLS) {
+            try {
+                List<RawEvent> leagueEvents = fetchEventsForUrl(url);
+                allEvents.addAll(leagueEvents);
+                if (!leagueEvents.isEmpty()) {
+                    log.info("✅ {}: {} событий", getLeagueNameFromUrl(url), leagueEvents.size());
+                }
+                Thread.sleep(2000); // пауза между лигами 2 секунды
+            } catch (Exception e) {
+                log.error("Ошибка при загрузке {}: {}", url, e.getMessage());
+            }
+        }
+
+        // Удаляем дубликаты по externalId
+        Map<String, RawEvent> uniqueEvents = new LinkedHashMap<>();
+        for (RawEvent event : allEvents) {
+            uniqueEvents.putIfAbsent(event.getExternalId(), event);
+        }
+
+        log.info("=== MARATHON ИТОГО: {} уникальных событий из {} лиг ===",
+                uniqueEvents.size(), FOOTBALL_URLS.size());
+        return new ArrayList<>(uniqueEvents.values());
+    }
+
+    private String getLeagueNameFromUrl(String url) {
+        if (url.contains("Premier-League")) return "АПЛ";
+        if (url.contains("Primera-Division")) return "Ла Лига";
+        if (url.contains("Serie-A")) return "Серия А";
+        if (url.contains("Bundesliga")) return "Бундеслига";
+        if (url.contains("Ligue-1")) return "Лига 1";
+        if (url.contains("Russia")) return "РПЛ";
+        if (url.contains("Primeira-Liga")) return "Португалия";
+        if (url.contains("Eredivisie")) return "Нидерланды";
+        if (url.contains("Super-Lig")) return "Турция";
+        if (url.contains("Brazil")) return "Бразилия";
+        if (url.contains("Argentina")) return "Аргентина";
+        if (url.contains("Champions-League")) return "Лига Чемпионов";
+        if (url.contains("Europa-League")) return "Лига Европы";
+        if (url.contains("Nations-League")) return "Лига Наций";
+        return url.substring(url.lastIndexOf("/", url.length() - 2) + 1, url.length() - 1);
+    }
+
+    private List<RawEvent> fetchEventsForUrl(String footballUrl) {
         List<RawEvent> allEvents = new ArrayList<>();
         marketsCache.clear();
 
         Playwright playwright = null;
         Browser browser = null;
         Page page = null;
+        BrowserContext context = null;
 
         try {
-            log.info("Создаем экземпляр Playwright...");
             playwright = Playwright.create();
-            log.info("Playwright создан успешно");
+            String userAgent = USER_AGENTS.get(new Random().nextInt(USER_AGENTS.size()));
 
-            log.info("Запускаем браузер Chromium...");
-            browser = playwright.chromium().launch(new BrowserType.LaunchOptions()
+            List<String> launchArgs = Arrays.asList(
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-blink-features=AutomationControlled"
+            );
+
+            BrowserType.LaunchOptions launchOptions = new BrowserType.LaunchOptions()
                     .setHeadless(true)
                     .setSlowMo(100)
-                    .setArgs(List.of("--no-sandbox", "--disable-dev-shm-usage")));
-            log.info("Браузер запущен успешно");
+                    .setArgs(launchArgs);
 
-            log.info("Создаем новую страницу...");
-            page = browser.newPage();
-            log.info("Страница создана");
+            browser = playwright.chromium().launch(launchOptions);
 
-            String fullUrl = BASE_URL + FOOTBALL_URL;
-            log.info("Загружаем страницу: {}", fullUrl);
-            page.navigate(fullUrl);
-            log.info("Страница загружена, ожидаем загрузки контента...");
+            Browser.NewContextOptions contextOptions = new Browser.NewContextOptions()
+                    .setUserAgent(userAgent)
+                    .setViewportSize(1920, 1080)
+                    .setLocale("ru-RU");
 
-            // Ждем полной загрузки страницы (включая динамический контент)
-            log.info("Ожидаем NetworkIdle...");
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            log.info("NetworkIdle достигнут");
+            context = browser.newContext(contextOptions);
+            page = context.newPage();
 
-            log.info("Ожидаем 10 секунд для React компонентов...");
-            page.waitForTimeout(10000);
-            log.info("Ожидание завершено");
+            String fullUrl = BASE_URL + footballUrl;
 
-            // Проверяем наличие селекторов
-            log.info("Проверяем наличие селектора #events_content...");
+            page.navigate(fullUrl, new Page.NavigateOptions().setTimeout(45000));
+            page.evaluate("window.scrollBy(0, 300)");
+            Thread.sleep(500);
+
+            page.waitForLoadState(LoadState.DOMCONTENTLOADED, new Page.WaitForLoadStateOptions().setTimeout(30000));
+            page.waitForTimeout(1500);
+
             try {
-                page.waitForSelector("#events_content", new Page.WaitForSelectorOptions().setTimeout(30000));
-                log.info("Селектор #events_content найден");
-            } catch (Exception e) {
-                log.warn("Селектор #events_content НЕ НАЙДЕН: {}", e.getMessage());
-                // Продолжаем выполнение, возможно селектор другой
+                page.waitForSelector(".bg.coupon-row, div[data-event-eventid]",
+                        new Page.WaitForSelectorOptions().setTimeout(10000));
+            } catch (TimeoutError e) {
+                return Collections.emptyList();
             }
 
-            log.info("Проверяем наличие селектора .bg.coupon-row...");
-            try {
-                page.waitForSelector(".bg.coupon-row", new Page.WaitForSelectorOptions().setTimeout(30000));
-                log.info("Селектор .bg.coupon-row найден");
-            } catch (Exception e) {
-                log.warn("Селектор .bg.coupon-row НЕ НАЙДЕН: {}", e.getMessage());
+            String pageTitle = page.title();
+            if (pageTitle.contains("Forbidden") || pageTitle.contains("Access Denied")) {
+                return Collections.emptyList();
             }
 
-            // Логируем HTML для отладки (первые 2000 символов)
-            String pageContent = page.content();
-            log.info("Содержимое страницы (первые 2000 символов): {}",
-                    pageContent.length() > 2000 ? pageContent.substring(0, 2000) : pageContent);
+            Map<String, String> leagueMap = buildLeagueMap(page);
 
-            // Находим ВСЕ блоки событий на странице
-            log.info("Ищем элементы .bg.coupon-row...");
-            List<ElementHandle> eventRows = page.querySelectorAll(".bg.coupon-row");
-            log.info("Найдено элементов .bg.coupon-row: {}", eventRows.size());
+            List<ElementHandle> eventRows = page.querySelectorAll(".bg.coupon-row, [class*='coupon-row']");
+            if (eventRows.isEmpty()) {
+                eventRows = page.querySelectorAll("div[data-event-eventid]");
+            }
 
             if (eventRows.isEmpty()) {
-                log.warn("НЕ НАЙДЕНО НИ ОДНОГО СОБЫТИЯ! Возможно изменилась структура сайта.");
-                log.info("Доступные классы на странице: {}", getAvailableClasses(page));
+                return Collections.emptyList();
             }
 
-            int processedCount = 0;
-            int noTeamsCount = 0;
-            int errorCount = 0;
+            Set<String> processedMatches = new HashSet<>();
 
-            for (int i = 0; i < eventRows.size(); i++) {
-                ElementHandle eventRow = eventRows.get(i);
-                log.debug("Обработка события {}", i + 1);
-
+            for (ElementHandle eventEl : eventRows) {
                 try {
-                    // Получаем ID события
-                    String eventId = eventRow.getAttribute("data-event-eventid");
-                    if (eventId == null) {
-                        eventId = eventRow.getAttribute("data-event-treeid");
-                        log.debug("data-event-eventid не найден, пробуем data-event-treeid: {}", eventId);
-                    }
-                    if (eventId == null) {
-                        eventId = UUID.randomUUID().toString();
-                        log.debug("ID события не найден, генерируем UUID: {}", eventId);
-                    }
+                    String eventId = eventEl.getAttribute("data-event-eventid");
+                    if (eventId == null) eventId = eventEl.getAttribute("data-event-treeid");
+                    if (eventId == null) eventId = UUID.randomUUID().toString();
+                    if (eventId.length() > 20) continue;
 
-                    // Парсим команды из .member-name
-                    List<ElementHandle> memberNames = eventRow.querySelectorAll(".member-name");
-                    if (memberNames.size() < 2) {
-                        noTeamsCount++;
-                        if (noTeamsCount <= 10) {
-                            String eventText = eventRow.textContent();
-                            String preview = eventText.length() > 300 ? eventText.substring(0, 300) : eventText;
-                            log.warn("Не найдены команды для события #{}, текст: {}", i + 1, preview);
-                        }
-                        continue;
-                    }
+                    List<ElementHandle> memberNames = eventEl.querySelectorAll(".member-name");
+                    if (memberNames.size() < 2) continue;
 
                     String homeTeam = memberNames.get(0).textContent().trim();
                     String awayTeam = memberNames.get(1).textContent().trim();
-                    log.info("🎯 Найден матч #{}: {} vs {} (ID: {})", i + 1, homeTeam, awayTeam, eventId);
+                    if (homeTeam.isEmpty() || awayTeam.isEmpty()) continue;
 
-                    // Парсим рынки
-                    log.debug("Парсим рынки для события {}", eventId);
-                    List<RawMarket> markets = parseMarketsFromEventRow(eventRow, eventId);
-                    log.debug("Найдено рынков: {}", markets.size());
+                    String matchKey = homeTeam + " vs " + awayTeam;
+                    if (processedMatches.contains(matchKey)) continue;
+                    processedMatches.add(matchKey);
+
+                    List<RawMarket> markets = parseMarketsFromEventRow(eventEl, eventId);
+                    if (markets.isEmpty()) {
+                        markets = parseMarketsAlternative(eventEl, eventId);
+                    }
 
                     marketsCache.put(eventId, markets);
-
-                    // Формируем URL события из data-event-path
-                    String eventPath = eventRow.getAttribute("data-event-path");
-                    String eventUrl;
-                    if (eventPath != null && !eventPath.isEmpty()) {
-                        eventUrl = BASE_URL + eventPath;
-                    } else {
-                        eventUrl = BASE_URL + "/su/betting/Football/event/" + eventId;
-                    }
 
                     RawEvent rawEvent = new RawEvent();
                     rawEvent.setExternalId(eventId);
                     rawEvent.setHomeTeamName(homeTeam);
                     rawEvent.setAwayTeamName(awayTeam);
                     rawEvent.setStartTime(LocalDateTime.now().plusDays(7));
-                    rawEvent.setLeagueName(extractLeagueName(eventRow));
+                    rawEvent.setLeagueName(extractLeagueName(eventEl, leagueMap));
                     rawEvent.setSportName("Football");
-                    rawEvent.setEventUrl(eventUrl);
+                    rawEvent.setEventUrl(BASE_URL + "/su/betting/Football/event/" + eventId);
                     rawEvent.setMarkets(markets);
 
                     allEvents.add(rawEvent);
-                    processedCount++;
-                    log.info("✅ Добавлено событие #{}: {} vs {} с {} рынками",
-                            processedCount, homeTeam, awayTeam, markets.size());
 
                 } catch (Exception e) {
-                    errorCount++;
-                    log.error("Ошибка парсинга события #{}: {}", i + 1, e.getMessage(), e);
+                    // тихо пропускаем ошибки парсинга отдельных событий
                 }
-            }
-
-            log.info("=== ИТОГИ ПАРСИНГА MARATHON ===");
-            log.info("Обработано событий: {}", processedCount);
-            log.info("Пропущено без команд: {}", noTeamsCount);
-            log.info("Ошибок при парсинге: {}", errorCount);
-            log.info("Всего собрано RawEvent: {}", allEvents.size());
-
-            if (allEvents.isEmpty()) {
-                log.warn("MARATHON НЕ НАШЕЛ НИ ОДНОГО СОБЫТИЯ!");
-                log.warn("Проверьте: 1) Доступность сайта {} 2) Структуру страницы", BASE_URL);
             }
 
         } catch (Exception e) {
-            log.error("!!! КРИТИЧЕСКАЯ ОШИБКА В MARATHON fetchEvents() !!!", e);
-            log.error("Тип ошибки: {}", e.getClass().getName());
-            log.error("Сообщение: {}", e.getMessage());
-
-            // Логируем stack trace полностью
-            for (StackTraceElement element : e.getStackTrace()) {
-                log.error("  at {}", element);
-            }
-
-            return Collections.emptyList();
-
+            // тихо пропускаем ошибки загрузки лиги
         } finally {
-            // Закрываем ресурсы в правильном порядке
-            log.info("Закрываем ресурсы Playwright...");
-            try {
-                if (page != null) {
-                    page.close();
-                    log.debug("Page закрыт");
-                }
-            } catch (Exception e) {
-                log.warn("Ошибка при закрытии page: {}", e.getMessage());
-            }
-
-            try {
-                if (browser != null) {
-                    browser.close();
-                    log.debug("Browser закрыт");
-                }
-            } catch (Exception e) {
-                log.warn("Ошибка при закрытии browser: {}", e.getMessage());
-            }
-
-            try {
-                if (playwright != null) {
-                    playwright.close();
-                    log.debug("Playwright закрыт");
-                }
-            } catch (Exception e) {
-                log.warn("Ошибка при закрытии playwright: {}", e.getMessage());
-            }
-
-            log.info("=== MARATHON fetchEvents() FINISHED, returning {} events ===", allEvents.size());
-        }
-
-        log.info("=== MARATHON: Найдено {} событий ===", allEvents.size());
-        for (RawEvent e : allEvents) {
-            log.info("  Marathon event: {} vs {}", e.getHomeTeamName(), e.getAwayTeamName());
+            try { if (page != null) page.close(); } catch (Exception e) {}
+            try { if (context != null) context.close(); } catch (Exception e) {}
+            try { if (browser != null) browser.close(); } catch (Exception e) {}
+            try { if (playwright != null) playwright.close(); } catch (Exception e) {}
         }
 
         return allEvents;
     }
 
-    // Добавьте этот вспомогательный метод для отладки
-    private String getAvailableClasses(Page page) {
+    private Map<String, String> buildLeagueMap(Page page) {
+        Map<String, String> leagueMap = new HashMap<>();
         try {
-            return page.evaluate("() => {" +
-                    "const elements = document.querySelectorAll('[class]');" +
-                    "const classes = new Set();" +
-                    "elements.forEach(el => {" +
-                    "  el.className.split(' ').forEach(c => classes.add(c));" +
-                    "});" +
-                    "return Array.from(classes).slice(0, 50).join(', ');" +
-                    "}").toString();
+            List<ElementHandle> containers = page.querySelectorAll(".category-container");
+            for (ElementHandle container : containers) {
+                String categoryTreeId = container.getAttribute("data-category-treeid");
+                if (categoryTreeId == null) continue;
+                ElementHandle labelTd = container.querySelector(".category-label-td");
+                if (labelTd == null) continue;
+                ElementHandle leagueDiv = labelTd.querySelector("div");
+                String leagueName = leagueDiv != null ? leagueDiv.textContent().trim() : labelTd.textContent().trim();
+                if (!leagueName.isEmpty() && leagueName.length() < 100) {
+                    leagueMap.put(categoryTreeId, leagueName);
+                }
+            }
         } catch (Exception e) {
-            return "Unable to get classes: " + e.getMessage();
+            // тихо
         }
+        return leagueMap;
     }
 
-    /**
-     * Извлекает название лиги из контекста события
-     */
-    /**
-     * Извлекает название лиги из контекста события
-     */
-    private String extractLeagueName(ElementHandle eventRow) {
+    private String extractLeagueName(ElementHandle eventRow, Map<String, String> leagueMap) {
         try {
-            // Получаем родительский элемент
-            ElementHandle parent = eventRow;
-
-            // Поднимаемся вверх по дереву, ищем category-container
-            for (int i = 0; i < 10; i++) { // максимум 10 уровней вверх
-                ElementHandle tmp = parent.querySelector("xpath=..");
-                if (tmp == null) break;
-                parent = tmp;
-
-                // Проверяем класс родителя
-                String className = parent.getAttribute("class");
-                if (className != null && className.contains("category-container")) {
-                    // Нашли контейнер категории - ищем в нем название
-                    ElementHandle categoryLabel = parent.querySelector(".category-label");
-                    if (categoryLabel != null) {
-                        String leagueText = categoryLabel.textContent().trim();
-                        if (leagueText.length() > 0 && leagueText.length() < 100) {
-                            return leagueText;
-                        }
-                    }
-                    break;
-                }
-            }
-
-            // Альтернативный способ: ищем по ближайшему category-container через querySelector
             ElementHandle container = eventRow.querySelector("xpath=ancestor::div[contains(@class, 'category-container')]");
             if (container != null) {
-                ElementHandle categoryLabel = container.querySelector(".category-label");
-                if (categoryLabel != null) {
-                    String leagueText = categoryLabel.textContent().trim();
-                    if (leagueText.length() > 0 && leagueText.length() < 100) {
-                        return leagueText;
-                    }
+                String categoryId = container.getAttribute("data-category-treeid");
+                if (categoryId != null && leagueMap.containsKey(categoryId)) {
+                    return leagueMap.get(categoryId);
                 }
             }
-
         } catch (Exception e) {
-            log.debug("Не удалось определить лигу: {}", e.getMessage());
+            // тихо
         }
         return "Unknown League";
     }
 
+    private List<RawMarket> parseMarketsAlternative(ElementHandle eventRow, String eventId) {
+        List<RawMarket> markets = new ArrayList<>();
+        try {
+            List<ElementHandle> oddsElements = eventRow.querySelectorAll("[class*='price'], [class*='odds'], .selection-link");
+            for (ElementHandle el : oddsElements) {
+                String text = el.textContent().trim();
+                BigDecimal odds = parseOdds(text);
+                if (odds == null) continue;
+                RawMarket market = new RawMarket();
+                market.setExternalId(eventId + "_WIN_DRAW_WIN");
+                market.setExternalEventId(eventId);
+                market.setMarketTypeName("WIN_DRAW_WIN");
+                market.setPeriodName("FULL_TIME");
+                RawOutcome outcome = new RawOutcome();
+                outcome.setExternalMarketId(market.getExternalId());
+                outcome.setOutcomeKeyName("HOME_WIN");
+                outcome.setOutcomeValueDescription("П1");
+                outcome.setOdds(odds);
+                outcome.setActive(true);
+                market.setOutcomes(new ArrayList<>());
+                market.getOutcomes().add(outcome);
+                markets.add(market);
+                break;
+            }
+        } catch (Exception e) {
+            // тихо
+        }
+        return markets;
+    }
+
     private List<RawMarket> parseMarketsFromEventRow(ElementHandle eventRow, String eventId) {
         List<RawMarket> markets = new ArrayList<>();
-
-        // Находим все ячейки с ценами (коэффициентами)
         List<ElementHandle> priceCells = eventRow.querySelectorAll("td.price");
-
         for (ElementHandle cell : priceCells) {
             try {
                 String marketType = cell.getAttribute("data-market-type");
                 if (marketType == null) continue;
-
-                // Находим span с коэффициентом
                 ElementHandle span = cell.querySelector("span.selection-link");
                 if (span == null) continue;
-
                 String priceText = span.textContent().trim();
                 BigDecimal odds = parseOdds(priceText);
                 if (odds == null) continue;
-
-                // Получаем значение линии (фора/тотал) из текста ячейки
                 String cellText = cell.textContent().trim();
                 String lineValue = extractLineValue(cellText);
-
-                // Определяем исход
                 String outcomeKey = determineOutcomeKey(cell, marketType);
                 String outcomeDesc = determineOutcomeDescription(cell, marketType, lineValue);
                 String mappedMarketType = mapMarketType(marketType);
-
-                // Находим или создаем рынок
                 RawMarket market = findOrCreateMarket(markets, eventId, mappedMarketType, lineValue);
-
                 RawOutcome outcome = new RawOutcome();
                 outcome.setExternalMarketId(market.getExternalId());
                 outcome.setOutcomeKeyName(outcomeKey);
                 outcome.setOutcomeValueDescription(outcomeDesc);
                 outcome.setOdds(odds);
                 outcome.setActive(true);
-
                 if (market.getOutcomes() == null) {
                     market.setOutcomes(new ArrayList<>());
                 }
                 market.getOutcomes().add(outcome);
-
-                log.debug("Рынок: {}, исход: {}, коэф: {}", marketType, outcomeDesc, odds);
-
             } catch (Exception e) {
-                log.debug("Ошибка парсинга ячейки: {}", e.getMessage());
+                // тихо
             }
         }
-
         return markets;
     }
 
     private RawMarket findOrCreateMarket(List<RawMarket> markets, String eventId, String marketType, String lineValue) {
         String marketId = eventId + "_" + marketType + (lineValue != null ? "_" + lineValue : "");
-
         for (RawMarket m : markets) {
             if (m.getExternalId().equals(marketId)) {
                 return m;
             }
         }
-
         RawMarket newMarket = new RawMarket();
         newMarket.setExternalId(marketId);
         newMarket.setExternalEventId(eventId);
         newMarket.setMarketTypeName(marketType);
         newMarket.setPeriodName("FULL_TIME");
-
         if (lineValue != null && !lineValue.isEmpty()) {
             try {
                 newMarket.setLine(new BigDecimal(lineValue));
             } catch (Exception e) {}
         }
-
         markets.add(newMarket);
         return newMarket;
     }
@@ -400,7 +382,6 @@ public class MarathonAdapter implements BookmakerAdapter {
 
     private String determineOutcomeKey(ElementHandle cell, String marketType) {
         String cellHtml = cell.innerHTML().toLowerCase();
-
         switch (marketType) {
             case "RESULT":
                 if (cellHtml.contains("match_result.1")) return "HOME_WIN";
@@ -426,7 +407,6 @@ public class MarathonAdapter implements BookmakerAdapter {
 
     private String determineOutcomeDescription(ElementHandle cell, String marketType, String lineValue) {
         String cellHtml = cell.innerHTML().toLowerCase();
-
         switch (marketType) {
             case "RESULT":
                 if (cellHtml.contains("match_result.1")) return "П1";
@@ -478,11 +458,6 @@ public class MarathonAdapter implements BookmakerAdapter {
 
     @Override
     public List<RawMarket> fetchMarkets(String externalEventId) {
-        if (marketsCache.containsKey(externalEventId)) {
-            log.debug("Возвращаем {} рынков для события {} из кэша",
-                    marketsCache.get(externalEventId).size(), externalEventId);
-            return marketsCache.get(externalEventId);
-        }
-        return new ArrayList<>();
+        return marketsCache.getOrDefault(externalEventId, new ArrayList<>());
     }
 }

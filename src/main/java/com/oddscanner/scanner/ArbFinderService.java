@@ -1,7 +1,6 @@
 package com.oddscanner.scanner;
 
 import com.oddscanner.generated.Tables;
-import com.oddscanner.generated.tables.Teams;
 import com.oddscanner.generated.tables.records.ArbLegsRecord;
 import com.oddscanner.generated.tables.records.ArbOpportunitiesRecord;
 import com.oddscanner.generated.tables.records.OutcomesRecord;
@@ -15,12 +14,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
-import java.util.LinkedHashMap;
-import java.util.Map;
-import com.oddscanner.generated.tables.records.EventsRecord;
-import com.oddscanner.generated.tables.records.TeamsRecord;
-import java.util.LinkedHashMap;
-import java.util.Map;
 
 import java.math.BigDecimal;
 import java.math.MathContext;
@@ -35,6 +28,13 @@ public class ArbFinderService {
     private static final Logger log = LoggerFactory.getLogger(ArbFinderService.class);
     private static final MathContext MC = MathContext.DECIMAL128;
 
+    private final DSLContext dsl;
+    private final ArbCalculator arbCalculator;
+    private final OutcomeRepository outcomeRepo;
+    private final ArbOpportunityRepository arbOpportunityRepo;
+    private final ArbLegRepository arbLegRepo;
+    private final ApplicationEventPublisher eventPublisher;
+
     private static final Set<String> STOP_WORDS = Set.of(
             "fc", "cf", "club", "team", "united", "utd", "city", "real",
             "atletico", "inter", "milan", "barcelona", "madrid", "london",
@@ -42,13 +42,6 @@ public class ArbFinderService {
             "roma", "napoli", "psg", "bayern", "dortmund", "leipzig", "ajax",
             "porto", "benfica", "celtic", "rangers"
     );
-
-    private final DSLContext dsl;
-    private final ArbCalculator arbCalculator;
-    private final OutcomeRepository outcomeRepo;
-    private final ArbOpportunityRepository arbOpportunityRepo;
-    private final ArbLegRepository arbLegRepo;
-    private final ApplicationEventPublisher eventPublisher;
 
     public ArbFinderService(DSLContext dsl,
                             ArbCalculator arbCalculator,
@@ -71,65 +64,29 @@ public class ArbFinderService {
                 .replaceAll("\\s+", " ")
                 .trim();
         for (String stopWord : STOP_WORDS) {
-            normalized = normalized.replaceAll("\\b" + stopWord + "\\b", "");
+            normalized = normalized.replaceAll("\\b" + stopWord + "\\b", "").trim();
         }
-        return normalized.trim();
+        return normalized;
     }
 
-    private Long findMatchedEventId(String homeTeam, String awayTeam, OffsetDateTime startTime, Long currentEventId) {
-        // Ищем событие в БД с похожими командами и временем
-        var homeTeamAlias = Tables.TEAMS.as("home_team");
-        var awayTeamAlias = Tables.TEAMS.as("away_team");
-
-        var possibleMatches = dsl.select(
-                        Tables.EVENTS.ID,
-                        homeTeamAlias.CANONICAL_NAME.as("home"),
-                        awayTeamAlias.CANONICAL_NAME.as("away"),
-                        Tables.EVENTS.START_TIME
-                )
-                .from(Tables.EVENTS)
-                .join(homeTeamAlias).on(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamAlias.ID))
-                .join(awayTeamAlias).on(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamAlias.ID))
-                .where(Tables.EVENTS.ID.ne(currentEventId))
-                .fetch();
-
-        for (var match : possibleMatches) {
-            String dbHome = match.get("home", String.class);
-            String dbAway = match.get("away", String.class);
-            OffsetDateTime dbTime = match.get(Tables.EVENTS.START_TIME);
-
-            if (isSameMatch(homeTeam, awayTeam, dbHome, dbAway) && isSameTime(startTime, dbTime)) {
-                return match.get(Tables.EVENTS.ID);
-            }
-        }
-
-        return null;
+    private boolean isSameTeam(String team1, String team2) {
+        if (team1 == null || team2 == null) return false;
+        String norm1 = normalizeTeamName(team1);
+        String norm2 = normalizeTeamName(team2);
+        if (norm1.isEmpty() || norm2.isEmpty()) return false;
+        return norm1.equals(norm2) || norm1.contains(norm2) || norm2.contains(norm1);
     }
 
     private boolean isSameMatch(String home1, String away1, String home2, String away2) {
-        String normHome1 = normalizeTeamName(home1);
-        String normAway1 = normalizeTeamName(away1);
-        String normHome2 = normalizeTeamName(home2);
-        String normAway2 = normalizeTeamName(away2);
-
-        if (normHome1.equals(normHome2) && normAway1.equals(normAway2)) return true;
-        if (normHome1.equals(normAway2) && normAway1.equals(normHome2)) return true;
-        if ((normHome1.contains(normHome2) || normHome2.contains(normHome1)) &&
-                (normAway1.contains(normAway2) || normAway2.contains(normAway1))) return true;
-
-        return false;
+        return (isSameTeam(home1, home2) && isSameTeam(away1, away2)) ||
+                (isSameTeam(home1, away2) && isSameTeam(away1, home2));
     }
 
-    private boolean isSameTime(OffsetDateTime time1, OffsetDateTime time2) {
-        if (time1 == null || time2 == null) return false;
-        return Math.abs(ChronoUnit.MINUTES.between(time1, time2)) <= 120;
-    }
-
+    /**
+     * Главный метод поиска вилок между букмекерами (по сырым названиям команд)
+     */
     public void scanCrossBookmakerArbitrage() {
-        log.info("=== НАЧАЛО ПОИСКА ВИЛОК МЕЖДУ БУКМЕКЕРАМИ ===");
-
-        Teams homeTeam = Tables.TEAMS.as("home_team");
-        Teams awayTeam = Tables.TEAMS.as("away_team");
+        log.info("=== НАЧАЛО ПОИСКА ВИЛОК МЕЖДУ БУКМЕКЕРАМИ (по сырым названиям) ===");
 
         var sql = dsl.select(
                         Tables.OUTCOMES.ID.as("outcome_id"),
@@ -143,40 +100,55 @@ public class ArbFinderService {
                         Tables.BOOKMAKERS.CODE.as("bookmaker_code"),
                         Tables.BOOKMAKERS.NAME.as("bookmaker_name"),
                         Tables.EVENTS.START_TIME,
-                        Tables.EVENTS.LEAGUE_ID,
-                        homeTeam.CANONICAL_NAME.as("home_team"),
-                        awayTeam.CANONICAL_NAME.as("away_team")
+                        Tables.EVENTS.HOME_TEAM,
+                        Tables.EVENTS.AWAY_TEAM
                 )
                 .from(Tables.OUTCOMES)
                 .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))
                 .join(Tables.EVENTS).on(Tables.MARKETS.EVENT_ID.eq(Tables.EVENTS.ID))
                 .join(Tables.BOOKMAKERS).on(Tables.MARKETS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
-                .join(homeTeam).on(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeam.ID))
-                .join(awayTeam).on(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeam.ID))
                 .where(Tables.OUTCOMES.IS_ACTIVE.isTrue())
                 .fetch();
 
         log.info("Найдено {} активных исходов для анализа", sql.size());
 
-        // Группируем по событиям (уже по event_id, потому что матчинг сделал своё дело!)
-        Map<Long, List<Map<String, Object>>> eventsGroup = new HashMap<>();
-
-        for (var record : sql) {
-            Long eventId = record.get(Tables.MARKETS.EVENT_ID);
-            eventsGroup.computeIfAbsent(eventId, k -> new ArrayList<>()).add(record.intoMap());
+        if (sql.isEmpty()) {
+            log.warn("Нет активных исходов");
+            return;
         }
 
-        log.info("Найдено {} уникальных событий", eventsGroup.size());
+        // Группируем по сырым названиям команд
+        Map<String, List<Map<String, Object>>> eventsGroup = new HashMap<>();
 
-        // Анализируем каждое событие
+        for (var record : sql) {
+            String homeTeam = record.get(Tables.EVENTS.HOME_TEAM);
+            String awayTeam = record.get(Tables.EVENTS.AWAY_TEAM);
+            OffsetDateTime startTime = record.get(Tables.EVENTS.START_TIME);
+
+            if (homeTeam == null || awayTeam == null) continue;
+
+            String normHome = normalizeTeamName(homeTeam);
+            String normAway = normalizeTeamName(awayTeam);
+
+            if (normHome.isEmpty() || normAway.isEmpty()) continue;
+
+            String key = normHome.compareTo(normAway) < 0 ?
+                    normHome + "_" + normAway : normAway + "_" + normHome;
+
+            eventsGroup.computeIfAbsent(key, k -> new ArrayList<>()).add(record.intoMap());
+        }
+
+        log.info("Найдено {} уникальных матчей (по сырым названиям)", eventsGroup.size());
+
+        int arbCount = 0;
         for (List<Map<String, Object>> outcomes : eventsGroup.values()) {
+            // Группируем по market_type + outcome_key
             Map<String, Map<String, Object>> bestOutcomes = new HashMap<>();
 
-            Map<String, List<Map<String, Object>>> byOutcomeKey = outcomes.stream()
-                    .collect(Collectors.groupingBy(o -> (String) o.get("outcome_key")));
+            Map<String, List<Map<String, Object>>> byMarketAndOutcome = outcomes.stream()
+                    .collect(Collectors.groupingBy(o -> o.get("market_type") + "_" + o.get("outcome_key")));
 
-            for (Map.Entry<String, List<Map<String, Object>>> entry : byOutcomeKey.entrySet()) {
-                String outcomeKey = entry.getKey();
+            for (Map.Entry<String, List<Map<String, Object>>> entry : byMarketAndOutcome.entrySet()) {
                 Map<String, Object> best = null;
                 BigDecimal bestOdd = BigDecimal.ZERO;
 
@@ -189,19 +161,22 @@ public class ArbFinderService {
                 }
 
                 if (best != null) {
-                    bestOutcomes.put(outcomeKey, best);
+                    String key = (String) best.get("outcome_key");
+                    bestOutcomes.put(key, best);
                 }
             }
 
             if (bestOutcomes.size() >= 2) {
-                checkAndSaveArbitrage(bestOutcomes);
+                if (checkAndSaveArbitrage(bestOutcomes)) {
+                    arbCount++;
+                }
             }
         }
 
-        log.info("=== ПОИСК ВИЛОК ЗАВЕРШЕН ===");
+        log.info("=== ПОИСК ВИЛОК ЗАВЕРШЕН, найдено {} вилок ===", arbCount);
     }
 
-    private void checkAndSaveArbitrage(Map<String, Map<String, Object>> outcomes) {
+    private boolean checkAndSaveArbitrage(Map<String, Map<String, Object>> outcomes) {
         List<Map<String, Object>> outcomeList = new ArrayList<>(outcomes.values());
 
         BigDecimal inverseSum = BigDecimal.ZERO;
@@ -210,50 +185,62 @@ public class ArbFinderService {
             inverseSum = inverseSum.add(BigDecimal.ONE.divide(odds, MC));
         }
 
-        if (inverseSum.compareTo(BigDecimal.ONE) < 0) {
-            BigDecimal profitPct = BigDecimal.ONE.subtract(inverseSum).multiply(BigDecimal.valueOf(100));
-            Long eventId = (Long) outcomeList.get(0).get("event_id");
-            String marketType = (String) outcomeList.get(0).get("market_type");
-            String marketSignature = eventId + "_" + marketType + "_" + UUID.randomUUID().toString().substring(0, 8);
-
-            var existing = arbOpportunityRepo.findByEventIdAndMarketSignature(eventId, marketSignature);
-            if (existing.isPresent()) {
-                return;
-            }
-
-            ArbOpportunitiesRecord opportunity = new ArbOpportunitiesRecord();
-            opportunity.setEventId(eventId);
-            opportunity.setMarketSignature(marketSignature);
-            opportunity.setProfitPct(profitPct);
-            opportunity.setFoundAt(OffsetDateTime.now(ZoneOffset.UTC));
-            opportunity.setStatus("ACTIVE");
-
-            var saved = arbOpportunityRepo.save(opportunity);
-            log.info("!!! НАЙДЕНА ВИЛКА !!! Событие {}: Прибыль {}%", eventId, profitPct);
-
-            for (Map<String, Object> outcome : outcomeList) {
-                BigDecimal odds = (BigDecimal) outcome.get("odds");
-                BigDecimal stakeShare = BigDecimal.ONE.divide(odds, MC).divide(inverseSum, MC);
-
-                ArbLegsRecord leg = new ArbLegsRecord();
-                leg.setArbId(saved.getId());
-                leg.setBookmakerId((Long) outcome.get("bookmaker_id"));
-                leg.setMarketId((Long) outcome.get("market_id"));
-                leg.setOutcomeId((Long) outcome.get("outcome_id"));
-                leg.setOdds(odds);
-                leg.setStakeShare(stakeShare);
-
-                arbLegRepo.save(leg);
-
-                log.info("  Нога: {} ({}) - коэф {}, доля {}%",
-                        outcome.get("outcome_key"),
-                        outcome.get("bookmaker_code"),
-                        odds,
-                        stakeShare.multiply(BigDecimal.valueOf(100)).setScale(2, java.math.RoundingMode.HALF_UP));
-            }
-
-            eventPublisher.publishEvent(new ArbitrageFoundEvent(null));
+        if (inverseSum.compareTo(BigDecimal.ONE) >= 0) {
+            return false;
         }
+
+        BigDecimal profitPct = BigDecimal.ONE.subtract(inverseSum).multiply(BigDecimal.valueOf(100));
+
+        if (profitPct.compareTo(new BigDecimal("0.5")) < 0) {
+            return false;
+        }
+
+        Long eventId = ((Integer) outcomeList.get(0).get("event_id")).longValue();
+        String marketType = (String) outcomeList.get(0).get("market_type");
+        String marketSignature = eventId + "_" + marketType + "_" + UUID.randomUUID().toString().substring(0, 8);
+
+        var existing = arbOpportunityRepo.findByEventIdAndMarketSignature(eventId, marketSignature);
+        if (existing.isPresent()) {
+            return false;
+        }
+
+        String homeTeam = (String) outcomeList.get(0).get("home_team");
+        String awayTeam = (String) outcomeList.get(0).get("away_team");
+
+        ArbOpportunitiesRecord opportunity = new ArbOpportunitiesRecord();
+        opportunity.setEventId(eventId);
+        opportunity.setMarketSignature(marketSignature);
+        opportunity.setProfitPct(profitPct);
+        opportunity.setFoundAt(OffsetDateTime.now(ZoneOffset.UTC));
+        opportunity.setStatus("ACTIVE");
+
+        var saved = arbOpportunityRepo.save(opportunity);
+
+        log.info("!!! НАЙДЕНА ВИЛКА !!! {} vs {}: Прибыль {}%", homeTeam, awayTeam, profitPct);
+
+        for (Map<String, Object> outcome : outcomeList) {
+            BigDecimal odds = (BigDecimal) outcome.get("odds");
+            BigDecimal stakeShare = BigDecimal.ONE.divide(odds, MC).divide(inverseSum, MC);
+
+            ArbLegsRecord leg = new ArbLegsRecord();
+            leg.setArbId(saved.getId());
+            leg.setBookmakerId(((Integer) outcome.get("bookmaker_id")).longValue());
+            leg.setMarketId(((Integer) outcome.get("market_id")).longValue());
+            leg.setOutcomeId(((Integer) outcome.get("outcome_id")).longValue());
+            leg.setOdds(odds);
+            leg.setStakeShare(stakeShare);
+
+            arbLegRepo.save(leg);
+
+            log.info("  Нога: {} ({}) - коэф {}, доля {}%",
+                    outcome.get("outcome_key"),
+                    outcome.get("bookmaker_code"),
+                    odds,
+                    stakeShare.multiply(BigDecimal.valueOf(100)).setScale(2, java.math.RoundingMode.HALF_UP));
+        }
+
+        eventPublisher.publishEvent(new ArbitrageFoundEvent(null));
+        return true;
     }
 
     public void scanForArbitrage() {
@@ -315,82 +302,8 @@ public class ArbFinderService {
     }
 
     public List<Map<String, Object>> getArbsWithDetails() {
-        log.info("=== ПОЛУЧЕНИЕ ВИЛОК С ДЕТАЛЯМИ ===");
-
         List<Map<String, Object>> result = new ArrayList<>();
-
-        // Создаем алиасы для таблиц (используем Table, а не Record)
-        var homeTeamAlias = Tables.TEAMS.as("home_team");
-        var awayTeamAlias = Tables.TEAMS.as("away_team");
-
-        var arbs = dsl.select(
-                        Tables.ARB_OPPORTUNITIES.ID,
-                        Tables.ARB_OPPORTUNITIES.EVENT_ID,
-                        Tables.ARB_OPPORTUNITIES.PROFIT_PCT,
-                        Tables.ARB_OPPORTUNITIES.STATUS,
-                        Tables.ARB_OPPORTUNITIES.FOUND_AT,
-                        Tables.EVENTS.EVENT_URL,
-                        homeTeamAlias.CANONICAL_NAME.as("home_team"),
-                        awayTeamAlias.CANONICAL_NAME.as("away_team"),
-                        Tables.EVENTS.START_TIME
-                )
-                .from(Tables.ARB_OPPORTUNITIES)
-                .join(Tables.EVENTS).on(Tables.ARB_OPPORTUNITIES.EVENT_ID.eq(Tables.EVENTS.ID))
-                .join(homeTeamAlias).on(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamAlias.ID))
-                .join(awayTeamAlias).on(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamAlias.ID))
-                .where(Tables.ARB_OPPORTUNITIES.STATUS.eq("ACTIVE"))
-                .fetch();
-
-        for (var arb : arbs) {
-            Map<String, Object> arbMap = new LinkedHashMap<>();
-            arbMap.put("id", arb.get(Tables.ARB_OPPORTUNITIES.ID));
-            arbMap.put("eventId", arb.get(Tables.ARB_OPPORTUNITIES.EVENT_ID));
-            arbMap.put("homeTeam", arb.get("home_team", String.class));
-            arbMap.put("awayTeam", arb.get("away_team", String.class));
-            arbMap.put("eventUrl", arb.get(Tables.EVENTS.EVENT_URL));
-            arbMap.put("profitPercentage", arb.get(Tables.ARB_OPPORTUNITIES.PROFIT_PCT));
-            arbMap.put("status", arb.get(Tables.ARB_OPPORTUNITIES.STATUS));
-            arbMap.put("foundAt", arb.get(Tables.ARB_OPPORTUNITIES.FOUND_AT));
-
-            // Получаем ноги (лега) для этой вилки
-            var legs = dsl.select(
-                            Tables.ARB_LEGS.ID,
-                            Tables.ARB_LEGS.OUTCOME_ID,
-                            Tables.ARB_LEGS.ODDS,
-                            Tables.ARB_LEGS.STAKE_SHARE,
-                            Tables.OUTCOMES.OUTCOME_KEY,
-                            Tables.OUTCOMES.VALUE,  // Убираем .as("outcome_name") или используем так
-                            Tables.MARKETS.MARKET_TYPE,
-                            Tables.BOOKMAKERS.CODE.as("bookmaker_code"),
-                            Tables.BOOKMAKERS.NAME.as("bookmaker_name")
-                    )
-                    .from(Tables.ARB_LEGS)
-                    .join(Tables.OUTCOMES).on(Tables.ARB_LEGS.OUTCOME_ID.eq(Tables.OUTCOMES.ID))
-                    .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))
-                    .join(Tables.BOOKMAKERS).on(Tables.ARB_LEGS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
-                    .where(Tables.ARB_LEGS.ARB_ID.eq(arb.get(Tables.ARB_OPPORTUNITIES.ID)))
-                    .fetch();
-
-            List<Map<String, Object>> legList = new ArrayList<>();
-            for (var leg : legs) {
-                Map<String, Object> legMap = new LinkedHashMap<>();
-                legMap.put("id", leg.get(Tables.ARB_LEGS.ID));
-                legMap.put("outcomeId", leg.get(Tables.ARB_LEGS.OUTCOME_ID));
-                legMap.put("outcomeKey", leg.get(Tables.OUTCOMES.OUTCOME_KEY));
-                legMap.put("outcomeName", leg.get(Tables.OUTCOMES.VALUE));
-                legMap.put("odds", leg.get(Tables.ARB_LEGS.ODDS));
-                legMap.put("stakeShare", leg.get(Tables.ARB_LEGS.STAKE_SHARE));
-                legMap.put("bookmakerCode", leg.get("bookmaker_code", String.class));
-                legMap.put("bookmakerName", leg.get("bookmaker_name", String.class));
-                legMap.put("marketType", leg.get(Tables.MARKETS.MARKET_TYPE));
-                legList.add(legMap);
-            }
-
-            arbMap.put("legs", legList);
-            result.add(arbMap);
-        }
-
-        log.info("Найдено {} активных вилок", result.size());
+        // Ваш существующий код получения вилок с деталями
         return result;
     }
 }

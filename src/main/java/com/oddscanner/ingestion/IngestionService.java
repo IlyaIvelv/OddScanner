@@ -132,128 +132,130 @@ public class IngestionService {
     }
 
     public void ingest(String bookmakerCode) {
-        log.info(">>> INGEST CALLED for bookmaker: {}", bookmakerCode);  //
-        log.info("Starting ingestion for bookmaker: {}", bookmakerCode);
+        log.info(">>> INGEST for: {}", bookmakerCode);
 
-        // Проверяем, активен ли букмекер в БД
         var bookmaker = dsl.selectFrom(Tables.BOOKMAKERS)
                 .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
                 .fetchOne();
 
-        if (bookmaker == null) {
-            log.error("Bookmaker not found in database for code: {}", bookmakerCode);
+        if (bookmaker == null || !bookmaker.getEnabled()) {
+            log.warn("Bookmaker {} not found or disabled", bookmakerCode);
             return;
         }
-
-        if (!bookmaker.getEnabled()) {
-            log.warn("⏭️ Bookmaker {} ({}) is DISABLED in database. Skipping ingestion.",
-                    bookmakerCode, bookmaker.getName());
-            return;
-        }
-
-        log.info("✅ Bookmaker {} ({}) is ENABLED. Proceeding with ingestion.",
-                bookmakerCode, bookmaker.getName());
 
         BookmakerAdapter adapter = adapters.get(bookmakerCode);
-        log.info("Adapter for {}: {}", bookmakerCode, adapter);  // <-- ДОБАВИТЬ
         if (adapter == null) {
-            log.error("No adapter found for bookmaker code: {}", bookmakerCode);
+            log.error("No adapter for: {}", bookmakerCode);
             return;
         }
 
         try {
+            long startTime = System.currentTimeMillis();
             List<RawEvent> rawEvents = adapter.fetchEvents();
-            log.info("Получено {} событий от адаптера {}", rawEvents.size(), bookmakerCode);
+            long fetchTime = System.currentTimeMillis() - startTime;
 
             if (rawEvents.isEmpty()) {
-                log.info("No events received from adapter for {}", bookmakerCode);
+                log.info("{}: 0 событий ({}с)", bookmakerCode.toUpperCase(), fetchTime / 1000);
                 return;
             }
 
-            log.info("Received {} events from adapter for {}", rawEvents.size(), bookmakerCode);
+            int newEvents = 0;
+            int updatedEvents = 0;
 
             for (RawEvent rawEvent : rawEvents) {
-                log.debug("Processing event: {} vs {} (external ID: {}) from {}",
-                        rawEvent.getHomeTeamName(),
-                        rawEvent.getAwayTeamName(),
-                        rawEvent.getExternalId(),
-                        bookmakerCode);
-
                 Long internalEventId = findOrCreateEvent(rawEvent, bookmakerCode);
+                if (internalEventId == null) continue;
 
-                if (internalEventId == null) {
-                    log.warn("Could not find or create internal event for external ID: {}. Skipping markets.", rawEvent.getExternalId());
-                    continue;
+                boolean isNew = saveMarketsAndOutcomes(rawEvent, internalEventId, bookmakerCode);
+                if (isNew) {
+                    newEvents++;
+                } else {
+                    updatedEvents++;
                 }
-
-                List<RawMarket> rawMarkets = adapter.fetchMarkets(rawEvent.getExternalId());
-                log.debug("Processing {} markets for event {} from {}", rawMarkets.size(), rawEvent.getExternalId(), bookmakerCode);
-
-                for (RawMarket rawMarket : rawMarkets) {
-                    MarketsRecord marketRecord = new MarketsRecord();
-                    marketRecord.setEventId(internalEventId);
-
-                    Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
-                            .from(Tables.BOOKMAKERS)
-                            .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
-                            .fetchOneInto(Long.class);
-
-                    if (bookmakerId == null) {
-                        log.error("Bookmaker ID not found for code: {}", bookmakerCode);
-                        continue;
-                    }
-                    marketRecord.setBookmakerId(bookmakerId);
-
-                    marketRecord.setMarketType(rawMarket.getMarketTypeName());
-                    marketRecord.setPeriod(rawMarket.getPeriodName());
-                    marketRecord.setLine(rawMarket.getLine());
-                    marketRecord.setSourceExternalId(rawMarket.getExternalId());
-
-                    MarketsRecord savedMarket = dsl.insertInto(Tables.MARKETS)
-                            .set(marketRecord)
-                            .onConflict(Tables.MARKETS.EVENT_ID, Tables.MARKETS.BOOKMAKER_ID,
-                                    Tables.MARKETS.MARKET_TYPE, Tables.MARKETS.PERIOD, Tables.MARKETS.LINE)
-                            .doUpdate()
-                            .set(Tables.MARKETS.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
-                            .set(Tables.MARKETS.SOURCE_EXTERNAL_ID, rawMarket.getExternalId())
-                            .returning(Tables.MARKETS.ID)
-                            .fetchOne();
-
-                    Long marketInternalId = savedMarket.getId();
-
-                    if (rawMarket.getOutcomes() != null) {
-                        for (RawOutcome rawOutcome : rawMarket.getOutcomes()) {
-                            OutcomesRecord outcomeRecord = new OutcomesRecord();
-                            outcomeRecord.setMarketId(marketInternalId);
-                            outcomeRecord.setOutcomeKey(rawOutcome.getOutcomeKeyName());
-                            outcomeRecord.setValue(rawOutcome.getOutcomeValueDescription());
-                            outcomeRecord.setOdds(rawOutcome.getOdds());
-                            outcomeRecord.setIsActive(rawOutcome.isActive());
-
-                            dsl.insertInto(Tables.OUTCOMES)
-                                    .set(outcomeRecord)
-                                    .onConflict(Tables.OUTCOMES.MARKET_ID, Tables.OUTCOMES.OUTCOME_KEY)
-                                    .doUpdate()
-                                    .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
-                                    .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
-                                    .set(Tables.OUTCOMES.VALUE, rawOutcome.getOutcomeValueDescription())
-                                    .set(Tables.OUTCOMES.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
-                                    .execute();
-                        }
-                    }
-                }
-
-                OddsUpdatedEvent event = new OddsUpdatedEvent(bookmakerCode, rawEvent.getExternalId());
-                eventPublisher.publishEvent(event);
-                log.debug("Published OddsUpdatedEvent for bookmaker {}, event {}", bookmakerCode, rawEvent.getExternalId());
             }
 
-            log.info("Completed ingestion for bookmaker: {}", bookmakerCode);
+            long totalTime = System.currentTimeMillis() - startTime;
+            log.info("{}: {} событий (новых: {}, обновлено: {}, за {}с)",
+                    bookmakerCode.toUpperCase(), rawEvents.size(), newEvents, updatedEvents, totalTime / 1000);
+
+            eventPublisher.publishEvent(new OddsUpdatedEvent(bookmakerCode, null));
 
         } catch (Exception e) {
-            log.error("Error during ingestion for bookmaker: {}", bookmakerCode, e);
+            log.error("{}: {}", bookmakerCode, e.getMessage());
         }
     }
+
+    private boolean saveMarketsAndOutcomes(RawEvent rawEvent, Long internalEventId, String bookmakerCode) {
+        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
+                .from(Tables.BOOKMAKERS)
+                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
+                .fetchOneInto(Long.class);
+
+        boolean hasNewMarkets = false;
+
+        for (RawMarket rawMarket : rawEvent.getMarkets()) {
+            MarketsRecord marketRecord = new MarketsRecord();
+            marketRecord.setEventId(internalEventId);
+            marketRecord.setBookmakerId(bookmakerId);
+            marketRecord.setMarketType(rawMarket.getMarketTypeName());
+            marketRecord.setPeriod(rawMarket.getPeriodName());
+            marketRecord.setLine(rawMarket.getLine());
+            marketRecord.setSourceExternalId(rawMarket.getExternalId());
+
+            // Пытаемся вставить, если конфликт - обновляем
+            int result = dsl.insertInto(Tables.MARKETS)
+                    .set(marketRecord)
+                    .onConflict(Tables.MARKETS.EVENT_ID, Tables.MARKETS.BOOKMAKER_ID,
+                            Tables.MARKETS.MARKET_TYPE, Tables.MARKETS.PERIOD, Tables.MARKETS.LINE)
+                    .doUpdate()
+                    .set(Tables.MARKETS.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
+                    .set(Tables.MARKETS.SOURCE_EXTERNAL_ID, rawMarket.getExternalId())
+                    .execute();
+
+            if (result == 1) {
+                hasNewMarkets = true;
+            }
+
+            // Получаем ID рынка - используем source_external_id для точного поиска
+            MarketsRecord savedMarket = dsl.selectFrom(Tables.MARKETS)
+                    .where(Tables.MARKETS.SOURCE_EXTERNAL_ID.eq(rawMarket.getExternalId()))
+                    .and(Tables.MARKETS.EVENT_ID.eq(internalEventId))
+                    .and(Tables.MARKETS.BOOKMAKER_ID.eq(bookmakerId))
+                    .fetchAny();  // <-- ЗАМЕНИЛ fetchOne() НА fetchAny()
+
+            if (savedMarket == null) {
+                // Fallback: ищем по полям
+                savedMarket = dsl.selectFrom(Tables.MARKETS)
+                        .where(Tables.MARKETS.EVENT_ID.eq(internalEventId))
+                        .and(Tables.MARKETS.BOOKMAKER_ID.eq(bookmakerId))
+                        .and(Tables.MARKETS.MARKET_TYPE.eq(rawMarket.getMarketTypeName()))
+                        .and(Tables.MARKETS.PERIOD.eq(rawMarket.getPeriodName()))
+                        .fetchAny();  // <-- ЗАМЕНИЛ fetchOne() НА fetchAny()
+            }
+
+            if (savedMarket == null) continue;
+
+            Long marketId = savedMarket.getId();
+
+            for (RawOutcome rawOutcome : rawMarket.getOutcomes()) {
+                dsl.insertInto(Tables.OUTCOMES)
+                        .set(Tables.OUTCOMES.MARKET_ID, marketId)
+                        .set(Tables.OUTCOMES.OUTCOME_KEY, rawOutcome.getOutcomeKeyName())
+                        .set(Tables.OUTCOMES.VALUE, rawOutcome.getOutcomeValueDescription())
+                        .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
+                        .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
+                        .onConflict(Tables.OUTCOMES.MARKET_ID, Tables.OUTCOMES.OUTCOME_KEY)
+                        .doUpdate()
+                        .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
+                        .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
+                        .set(Tables.OUTCOMES.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
+                        .execute();
+            }
+        }
+
+        return hasNewMarkets;
+    }
+
 
 //    private Long findOrCreateInternalEvent(RawEvent rawEvent, String bookmakerCode) {
 //        // Проверяем, не слишком ли старое событие (например, старше 2 часов)
@@ -596,9 +598,8 @@ public class IngestionService {
     }
 
     private Long findOrCreateEvent(RawEvent rawEvent, String bookmakerCode) {
-        Long sportId = 1L; // football по умолчанию
+        Long sportId = 1L;
 
-        // 1. Создаём или находим команды
         Long homeTeamId = findOrCreateTeamWithNormalization(rawEvent.getHomeTeamName(), sportId, bookmakerCode);
         Long awayTeamId = findOrCreateTeamWithNormalization(rawEvent.getAwayTeamName(), sportId, bookmakerCode);
 
@@ -607,10 +608,7 @@ public class IngestionService {
             return null;
         }
 
-        // 2. Создаём или находим лигу
         Long leagueId = findOrCreateLeague(rawEvent.getLeagueName(), sportId);
-
-        // ===== НОВАЯ ПРОВЕРКА: ищем существующее событие =====
         OffsetDateTime startTimeUtc = rawEvent.getStartTime().atOffset(ZoneOffset.UTC);
 
         EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
@@ -623,10 +621,7 @@ public class IngestionService {
                 .fetchOne();
 
         if (existingEvent != null) {
-            log.info("♻️ Найдено существующее событие ID: {} для {} vs {} [{}], обновляем ссылку",
-                    existingEvent.getId(), rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
-
-            // Обновляем внешнюю ссылку для этого БК
+            // Спам-логи убраны — только обновляем ссылку без вывода
             Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
                     .from(Tables.BOOKMAKERS)
                     .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
@@ -645,11 +640,9 @@ public class IngestionService {
                         .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, existingEvent.getId())
                         .execute();
             }
-
             return existingEvent.getId();
         }
 
-        // ===== Создаём новое событие (только если не нашли существующее) =====
         EventsRecord eventRecord = new EventsRecord();
         eventRecord.setHomeTeamId(homeTeamId);
         eventRecord.setAwayTeamId(awayTeamId);
@@ -670,7 +663,6 @@ public class IngestionService {
         log.info("✅ Создано новое событие ID: {} для {} vs {} [{}]",
                 eventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
 
-        // Сохраняем внешнюю ссылку
         Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
                 .from(Tables.BOOKMAKERS)
                 .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
@@ -692,6 +684,7 @@ public class IngestionService {
 
         return eventId;
     }
+
 
     /**
      * Находит или создаёт лигу
