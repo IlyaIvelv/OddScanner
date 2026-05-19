@@ -35,14 +35,6 @@ public class ArbFinderService {
     private final ArbLegRepository arbLegRepo;
     private final ApplicationEventPublisher eventPublisher;
 
-    private static final Set<String> STOP_WORDS = Set.of(
-            "fc", "cf", "club", "team", "united", "utd", "city", "real",
-            "atletico", "inter", "milan", "barcelona", "madrid", "london",
-            "chelsea", "liverpool", "arsenal", "manchester", "man", "juventus",
-            "roma", "napoli", "psg", "bayern", "dortmund", "leipzig", "ajax",
-            "porto", "benfica", "celtic", "rangers"
-    );
-
     public ArbFinderService(DSLContext dsl,
                             ArbCalculator arbCalculator,
                             OutcomeRepository outcomeRepo,
@@ -59,13 +51,33 @@ public class ArbFinderService {
 
     private String normalizeTeamName(String name) {
         if (name == null || name.isEmpty()) return "";
+
+        String original = name;
         String normalized = name.toLowerCase()
-                .replaceAll("[^a-zа-я0-9\\s]", "")
+                .replaceAll("[^a-zа-я0-9\\s]", " ")
                 .replaceAll("\\s+", " ")
                 .trim();
-        for (String stopWord : STOP_WORDS) {
-            normalized = normalized.replaceAll("\\b" + stopWord + "\\b", "").trim();
-        }
+
+        // Убираем распространённые суффиксы и приставки
+        normalized = normalized.replaceAll("\\b(резерв|рез|reserve|res|u\\d{2}|до\\d{2}|мол|молодёжная|молодежная|юн|юношеская|юношеский|жен|женщины|женская)\\b", "")
+                .replaceAll("\\b(fc|cf|club|team|united|utd|city|real|atletico|inter|milan|barcelona|madrid|london|chelsea|liverpool|arsenal|manchester|man|juventus|roma|napoli|psg|bayern|dortmund|leipzig|ajax|porto|benfica|celtic|rangers|динамо|спартак|цска|локомотив|зенит|краснодар|ростов|ахмат|урал|крыльясоветов)\\b", "")
+                .replaceAll("\\s+", " ")
+                .trim();
+
+        // Убираем слова в скобках
+        normalized = normalized.replaceAll("\\s*\\([^)]*\\)\\s*", " ");
+
+        // Убираем тире и точки
+        normalized = normalized.replaceAll("[-.]", " ");
+
+        // Убираем номера команд (1, 2, 3, II, III)
+        normalized = normalized.replaceAll("\\b[ivxlcdm]+\\b", "")
+                .replaceAll("\\b\\d+\\b", " ");
+
+        // Сокращаем множественные пробелы
+        normalized = normalized.replaceAll("\\s+", " ").trim();
+
+        log.debug("Нормализация: '{}' -> '{}'", original, normalized);
         return normalized;
     }
 
@@ -135,6 +147,8 @@ public class ArbFinderService {
             String key = normHome.compareTo(normAway) < 0 ?
                     normHome + "_" + normAway : normAway + "_" + normHome;
 
+            log.debug("Ключ матча: {} -> {} vs {} ({} / {})", key, homeTeam, awayTeam, normHome, normAway);
+
             eventsGroup.computeIfAbsent(key, k -> new ArrayList<>()).add(record.intoMap());
         }
 
@@ -191,7 +205,7 @@ public class ArbFinderService {
 
         BigDecimal profitPct = BigDecimal.ONE.subtract(inverseSum).multiply(BigDecimal.valueOf(100));
 
-        if (profitPct.compareTo(new BigDecimal("0.5")) < 0) {
+        if (profitPct.compareTo(new BigDecimal("0.1")) < 0) {
             return false;
         }
 

@@ -1,4 +1,4 @@
-package com.oddscanner.bookmaker.Betcity;
+package com.oddscanner.bookmaker.betcity;
 
 public class BetcityMatch {
     private String homeTeam;

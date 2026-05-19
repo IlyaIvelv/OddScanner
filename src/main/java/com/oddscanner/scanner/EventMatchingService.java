@@ -15,7 +15,7 @@ public class EventMatchingService {
     private static final Logger log = LoggerFactory.getLogger(EventMatchingService.class);
 
     private static final int MAX_TIME_DIFF_MINUTES = 30;
-    private static final double MIN_NAME_SIMILARITY = 0.7;
+    private static final double MIN_NAME_SIMILARITY = 0.1;
 
     /**
      * Матчит события из двух списков по командам и времени

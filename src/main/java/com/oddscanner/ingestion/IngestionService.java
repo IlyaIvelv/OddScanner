@@ -16,6 +16,7 @@ import com.oddscanner.normalization.LeagueMatcher;
 import com.oddscanner.normalization.SportMatcher;
 import com.oddscanner.normalization.TeamMatcher;
 import com.oddscanner.scanner.EventMatcherService;
+import com.oddscanner.utils.ConsoleColors;
 import org.jooq.DSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -83,7 +84,7 @@ public class IngestionService {
         var allBookmakers = dsl.selectFrom(Tables.BOOKMAKERS).fetch();
         for (var bm : allBookmakers) {
             log.info("  Букмекер: code='{}', name='{}', enabled={}",
-                    bm.getCode(), bm.getName(), bm.getEnabled());
+                    bm.getCode(), bm.getName(), ConsoleColors.status(bm.getEnabled()));
         }
         log.info("  schedulerEnabled='{}'", schedulerEnabled);
 

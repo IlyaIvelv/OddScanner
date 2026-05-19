@@ -1,4 +1,4 @@
-package com.oddscanner.bookmaker.Betcity;
+package com.oddscanner.bookmaker.betcity;
 
 import com.microsoft.playwright.*;
 import com.microsoft.playwright.options.LoadState;
@@ -93,14 +93,29 @@ public class BetcityParser implements BookmakerAdapter {
         return allEvents;
     }
 
+
+
     private List<String> findTournamentUrls(Page page) {
         List<String> urls = new ArrayList<>();
 
         try {
             log.info("Поиск турниров на главной странице...");
-            page.navigate(BASE_URL + LINE_URL);
-            page.waitForLoadState(LoadState.NETWORKIDLE);
-            page.waitForTimeout(5000);
+
+            // ========== ВСТАВЬ ЭТОТ БЛОК ==========
+            for (int attempt = 1; attempt <= 3; attempt++) {
+                try {
+                    page.navigate(BASE_URL + LINE_URL);
+                    page.waitForLoadState(LoadState.NETWORKIDLE);
+                    page.waitForTimeout(5000);
+                    log.info("Страница загружена, попытка {}", attempt);
+                    break; // успех — выходим
+                } catch (Exception e) {
+                    log.warn("Попытка {} не удалась: {}", attempt, e.getMessage());
+                    if (attempt == 3) throw e;
+                    Thread.sleep(5000); // ждём 5 секунд перед повтором
+                }
+            }
+            // =====================================
 
             List<ElementHandle> links = page.querySelectorAll("a");
 
@@ -126,7 +141,6 @@ public class BetcityParser implements BookmakerAdapter {
 
         return urls;
     }
-
 
 
     private List<RawEvent> parseTournamentStandalone(String tournamentUrl) {
