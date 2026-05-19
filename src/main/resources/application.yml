@@ -32,6 +32,11 @@ oddscanner:
       enabled: false
       base-url: https://www.thesportsdb.com
       refresh-seconds: 60
+    betcity:
+      enabled: true
+      base-url: https://betcity.ru
+      refresh-seconds: 30
+      line-url: /ru/line/soccer
   scanner:
     trigger-mode: SCHEDULED # AFTER_INGEST | SCHEDULED | HYBRID
     cron: "* * */1 * * *"
@@ -52,6 +57,7 @@ scheduler:
 logging:
   level:
     com.oddscanner.bookmaker.fonbet: DEBUG
+    com.oddscanner.bookmaker.betcity: DEBUG
     com.microsoft.playwright: DEBUG
 
 springdoc:

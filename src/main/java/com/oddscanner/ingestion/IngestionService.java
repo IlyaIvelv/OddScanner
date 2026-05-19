@@ -425,8 +425,18 @@ public class IngestionService {
         log.info("📊 Найдено активных букмекеров: {} ({})", activeBookmakers.size(), activeNames);
 
         for (var bm : bookmakers) {
-            String status = bm.get(Tables.BOOKMAKERS.ENABLED) ? "✅ АКТИВЕН" : "❌ НЕ АКТИВЕН";
-            String registered = adapters.containsKey(bm.get(Tables.BOOKMAKERS.CODE)) ? " (зарегистрирован)" : " (НЕ зарегистрирован)";
+            // Цветной вывод: зелёный для enabled, красный для disabled
+            String status;
+            if (bm.get(Tables.BOOKMAKERS.ENABLED)) {
+                status = "\u001B[32m✅ АКТИВЕН\u001B[0m";   // Зелёный
+            } else {
+                status = "\u001B[31m❌ НЕ АКТИВЕН\u001B[0m"; // Красный
+            }
+
+            String registered = adapters.containsKey(bm.get(Tables.BOOKMAKERS.CODE))
+                    ? " (зарегистрирован)"
+                    : " (НЕ зарегистрирован)";
+
             log.info("- ID: {}, Code: {}, Name: {} - {}{}",
                     bm.get(Tables.BOOKMAKERS.ID),
                     bm.get(Tables.BOOKMAKERS.CODE),
@@ -529,15 +539,6 @@ public class IngestionService {
             }
         }
 
-//        // ВРЕМЕННО: не создаём новые события
-//        log.warn("⚠️ ВРЕМЕННО: Не создаём новое событие для {} vs {}, пропускаем",
-//                rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-//        return null;
-
-//        // 3. Не нашли — создаём новое событие
-//        log.info("🆕 Событие не найдено, создаём новое: {} vs {} [{}]",
-//                rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
-//        // В конце, если не нашли:
         log.info("🆕 Событие не найдено, создаём новое: {} vs {} [{}]",
                 rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
         return createNewEvent(rawEvent, bookmakerCode);
@@ -622,10 +623,10 @@ public class IngestionService {
         EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
                 .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
                 .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
-                .and(Tables.EVENTS.START_TIME.between(
-                        startTimeUtc.minusHours(2),
-                        startTimeUtc.plusHours(2)
-                ))
+//                .and(Tables.EVENTS.START_TIME.between(
+//                        startTimeUtc.minusHours(2),
+//                        startTimeUtc.plusHours(2)
+//                ))
                 .fetchOne();
 
         if (existingEvent != null) {
