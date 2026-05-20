@@ -10,5 +10,6 @@ public interface ArbOpportunityRepository {
     Optional<ArbOpportunitiesRecord> findById(Long id);
     Optional<ArbOpportunitiesRecord> findByEventIdAndMarketSignature(Long eventId, String marketSignature);
     ArbOpportunitiesRecord save(ArbOpportunitiesRecord record);
+    List<ArbOpportunitiesRecord> findActiveWithEventDetails();
     void updateStatus(Long id, String status);
 }

@@ -1,6 +1,6 @@
 package com.oddscanner;
 
-import com.oddscanner.generated.tables.records.BookmakersRecord;
+
 import com.oddscanner.ingestion.IngestionService;
 import com.oddscanner.repository.JooqBookmakerRepository;
 import org.slf4j.Logger;

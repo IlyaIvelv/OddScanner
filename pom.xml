@@ -20,45 +20,13 @@
     <properties>
         <java.version>21</java.version>
         <playwright.version>1.44.0</playwright.version>
-        <jooq.version>3.19.8</jooq.version>
+        <jooq.version>3.19.7</jooq.version>
         <commons-text.version>1.12.0</commons-text.version>
         <springdoc.version>2.5.0</springdoc.version>
         <argLine>-Dfile.encoding=UTF-8</argLine>
-        <skip.jooq.generation>true</skip.jooq.generation>
     </properties>
 
-    <profiles>
-        <profile>
-            <id>generate-jooq</id>
-            <activation>
-                <property>
-                    <name>generateJooq</name>
-                    <value>true</value>
-                </property>
-            </activation>
-            <build>
-                <plugins>
-                    <plugin>
-                        <groupId>org.jooq</groupId>
-                        <artifactId>jooq-codegen-maven</artifactId>
-                        <version>3.19.8</version>
-                        <executions>
-                            <execution>
-                                <id>generate-jooq-sources</id>
-                                <phase>generate-sources</phase>
-                                <goals>
-                                    <goal>generate</goal>
-                                </goals>
-                            </execution>
-                        </executions>
-                    </plugin>
-                </plugins>
-            </build>
-        </profile>
-    </profiles>
-
     <dependencies>
-        <!-- Spring Boot Starters -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-web</artifactId>
@@ -75,12 +43,20 @@
         <dependency>
             <groupId>org.jooq</groupId>
             <artifactId>jooq</artifactId>
+            <version>${jooq.version}</version>
         </dependency>
+        <dependency>
+            <groupId>org.jooq</groupId>
+            <artifactId>jooq-meta</artifactId>
+            <version>${jooq.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.postgresql</groupId>
             <artifactId>postgresql</artifactId>
             <scope>runtime</scope>
         </dependency>
+
         <dependency>
             <groupId>org.flywaydb</groupId>
             <artifactId>flyway-core</artifactId>
@@ -93,7 +69,7 @@
         <dependency>
             <groupId>com.microsoft.playwright</groupId>
             <artifactId>playwright</artifactId>
-            <version>1.44.0</version>
+            <version>${playwright.version}</version>
         </dependency>
 
         <dependency>
@@ -101,41 +77,30 @@
             <artifactId>jackson-databind</artifactId>
         </dependency>
 
-
-        <!-- Utils & Logic -->
         <dependency>
             <groupId>org.projectlombok</groupId>
             <artifactId>lombok</artifactId>
             <optional>true</optional>
         </dependency>
+
         <dependency>
             <groupId>org.apache.commons</groupId>
             <artifactId>commons-text</artifactId>
             <version>${commons-text.version}</version>
         </dependency>
 
-
-        <!-- Jackson для JSON парсинга -->
-        <dependency>
-            <groupId>com.fasterxml.jackson.core</groupId>
-            <artifactId>jackson-databind</artifactId>
-            <version>2.15.2</version>
-        </dependency>
-
-
-        <!-- API Docs -->
         <dependency>
             <groupId>org.springdoc</groupId>
             <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
             <version>${springdoc.version}</version>
         </dependency>
+
         <dependency>
             <groupId>org.jsoup</groupId>
             <artifactId>jsoup</artifactId>
             <version>1.18.1</version>
         </dependency>
-        
-        <!-- Test -->
+
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
@@ -156,6 +121,20 @@
     <build>
         <plugins>
             <plugin>
+                <groupId>org.flywaydb</groupId>
+                <artifactId>flyway-maven-plugin</artifactId>
+                <version>11.7.2</version>
+                <configuration>
+                    <url>jdbc:postgresql://localhost:5433/oddscanner</url>
+                    <user>user</user>
+                    <password>password</password>
+                    <schemas>public</schemas>
+                    <locations>filesystem:src/main/resources/db/migration</locations>
+                    <baselineOnMigrate>true</baselineOnMigrate>
+                </configuration>
+            </plugin>
+
+            <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
                 <configuration>
@@ -167,57 +146,57 @@
                     </excludes>
                 </configuration>
             </plugin>
+
             <plugin>
                 <groupId>org.jooq</groupId>
                 <artifactId>jooq-codegen-maven</artifactId>
                 <version>${jooq.version}</version>
-                <executions>
-                    <execution>
-                        <id>generate-jooq-sources</id>
-                        <phase>generate-sources</phase>
-                        <goals>
-                            <goal>generate</goal>
-                        </goals>
-                    </execution>
-                </executions>
                 <configuration>
-                    <onError>SILENT</onError>
                     <jdbc>
-                        <driver>org.postgresql.Driver</driver>
                         <url>jdbc:postgresql://localhost:5433/oddscanner</url>
                         <user>user</user>
                         <password>password</password>
                     </jdbc>
                     <generator>
-                        <name>org.jooq.codegen.JavaGenerator</name>
                         <database>
                             <name>org.jooq.meta.postgres.PostgresDatabase</name>
-                            <includes>.*</includes>
-                            <excludes>flyway_schema_history</excludes>
                             <inputSchema>public</inputSchema>
+                            <includes>.*</includes>
+                            <excludes>
+                                flyway_schema_history
+                            </excludes>
                         </database>
+                        <generate>
+                            <pojos>false</pojos>
+                            <daos>false</daos>
+                            <records>true</records>
+                            <interfaces>false</interfaces>
+                            <immutablePojos>false</immutablePojos>
+                            <fluentSetters>true</fluentSetters>
+                        </generate>
                         <target>
                             <packageName>com.oddscanner.generated</packageName>
                             <directory>src/main/java</directory>
                         </target>
                     </generator>
                 </configuration>
+                <dependencies>
+                    <dependency>
+                        <groupId>org.postgresql</groupId>
+                        <artifactId>postgresql</artifactId>
+                        <version>42.7.5</version>
+                    </dependency>
+                </dependencies>
             </plugin>
+
         </plugins>
     </build>
 
-    <!-- ПЕРЕОПРЕДЕЛЯЕМ РЕПОЗИТОРИИ ЧТОБЫ Maven Central БЫЛ ПЕРВЫМ -->
     <repositories>
         <repository>
             <id>central</id>
             <name>Maven Central</name>
             <url>https://repo.maven.apache.org/maven2</url>
-            <releases>
-                <enabled>true</enabled>
-            </releases>
-            <snapshots>
-                <enabled>false</enabled>
-            </snapshots>
         </repository>
     </repositories>
 
@@ -226,12 +205,6 @@
             <id>central</id>
             <name>Maven Central</name>
             <url>https://repo.maven.apache.org/maven2</url>
-            <releases>
-                <enabled>true</enabled>
-            </releases>
-            <snapshots>
-                <enabled>false</enabled>
-            </snapshots>
         </pluginRepository>
     </pluginRepositories>
 </project>

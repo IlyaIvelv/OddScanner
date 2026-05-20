@@ -8,6 +8,8 @@ import com.oddscanner.repository.ArbLegRepository;
 import com.oddscanner.repository.ArbOpportunityRepository;
 import com.oddscanner.repository.OutcomeRepository; // Добавим, если нужно получить outcomeKey
 import com.oddscanner.scanner.ArbFinderService;
+import com.oddscanner.scanner.dto.ArbOpportunityWithDetailsDto;
+import com.oddscanner.scanner.dto.ArbOpportunityWithEventDto;
 import com.oddscanner.scanner.dto.ArbitrageOpportunityResponseDTO; // Используем правильный пакет
 import com.oddscanner.scanner.dto.ArbLegResponseDTO; // Используем правильный пакет
 import io.swagger.v3.oas.annotations.Operation;
@@ -153,4 +155,11 @@ public class ArbController {
     public ResponseEntity<List<Map<String, Object>>> getArbsWithDetails() {
         return ResponseEntity.ok(arbFinderService.getArbsWithDetails());
     }
+
+    @GetMapping("/opportunities/with-details")
+    public ResponseEntity<List<ArbOpportunityWithDetailsDto>> getActiveArbsWithDetails() {
+        List<ArbOpportunityWithDetailsDto> arbs = arbFinderService.getActiveArbsWithEventDetails();
+        return ResponseEntity.ok(arbs);
+    }
+
 }

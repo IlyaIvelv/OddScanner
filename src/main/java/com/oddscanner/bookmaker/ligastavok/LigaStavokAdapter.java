@@ -1,36 +1,35 @@
 package com.oddscanner.bookmaker.ligastavok;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.microsoft.playwright.*;
 import com.oddscanner.bookmaker.api.BookmakerAdapter;
 import com.oddscanner.bookmaker.api.RawEvent;
 import com.oddscanner.bookmaker.api.RawMarket;
 import com.oddscanner.bookmaker.api.RawOutcome;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
 import java.math.BigDecimal;
-import java.net.URI;
-import java.net.http.HttpClient;
-import java.net.http.HttpRequest;
-import java.net.http.HttpResponse;
-import java.time.Instant;
 import java.time.LocalDateTime;
-import java.time.ZoneId;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 @Component
 @Order(4)
 public class LigaStavokAdapter implements BookmakerAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(LigaStavokAdapter.class);
-    private static final String API_URL = "https://lds-api-sites.ligastavok.ru/rest/events/v8/eventsList";
+    private static final String BASE_URL = "https://www.ligastavok.ru";
+    private static final String CDP_URL = "http://localhost:9222";
 
-    private final HttpClient httpClient = HttpClient.newHttpClient();
-    private final ObjectMapper mapper = new ObjectMapper();
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    // Хранилище для URL, извлечённых из API
+    private final Map<String, String> eventUrlCache = new HashMap<>();
 
     @Override
     public String code() {
@@ -40,237 +39,236 @@ public class LigaStavokAdapter implements BookmakerAdapter {
     @Override
     public List<RawEvent> fetchEvents() {
         log.info("=== НАЧАЛО ПАРСИНГА ЛИГА СТАВОК ===");
+        eventUrlCache.clear();
 
-        try {
-            String requestBody = buildRequestBody();
-            String json = fetchEventsJson(requestBody);
+        List<RawEvent> allEvents = new ArrayList<>();
 
-            if (json != null) {
-                log.info("Получен ответ, длина: {} символов", json.length());
-                return parseEvents(json);
+        try (Playwright playwright = Playwright.create()) {
+            Browser browser = playwright.chromium().connectOverCDP(CDP_URL);
+            log.info("✅ Подключено к Chrome");
+
+            // Находим или создаём страницу
+            Page page = findOrCreatePrematchPage(browser);
+            if (page == null) {
+                log.error("❌ Не найдена вкладка с Лигой Ставок");
+                return allEvents;
             }
+
+            // НАСТРАИВАЕМ ПЕРЕХВАТ API-ЗАПРОСОВ
+            setupApiInterceptor(page);
+
+            // Обновляем страницу
+            page.reload();
+            page.waitForTimeout(5000); // Ждём загрузки API
+
+            // Даём время на обработку API-ответов
+            page.waitForTimeout(3000);
+
+            // Теперь в eventUrlCache должны быть правильные URL
+
+            // Скроллим для подгрузки всех событий
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)");
+            page.waitForTimeout(2000);
+            page.evaluate("window.scrollTo(0, 0)");
+            page.waitForTimeout(1000);
+
+            // Парсим HTML
+            String html = page.content();
+            saveDebugHtml(html);
+
+            // Парсим события, передавая кэш с URL
+            allEvents = parseEventsFromHtml(html, eventUrlCache);
 
         } catch (Exception e) {
-            log.error("Ошибка при парсинге: {}", e.getMessage(), e);
+            log.error("❌ Ошибка: {}", e.getMessage(), e);
         }
 
-        return new ArrayList<>();
+        log.info("=== ЛИГА СТАВОК: найдено {} событий ===", allEvents.size());
+        return allEvents;
     }
 
-    private String buildRequestBody() {
-        // TODO: Замени на точный JSON из твоего сниффера
-        return """
-        {
-            "filter": {
-                "sportIds": [1],
-                "competitionIds": [],
-                "eventStatuses": ["LIVE", "PREMATCH"],
-                "withMargin": false
-            },
-            "actionLines": ["LINE", "LIVE"],
-            "tournamentTree": false,
-            "getEventDate": true
-        }
-        """;
-    }
-
-    private String fetchEventsJson(String requestBody) {
-        try {
-            HttpRequest request = HttpRequest.newBuilder()
-                    .uri(URI.create(API_URL))
-                    .header("Content-Type", "application/json")
-                    .header("Accept", "application/json")
-                    .header("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
-                    .header("Origin", "https://www.ligastavok.ru")
-                    .header("Referer", "https://www.ligastavok.ru/")
-                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36")
-                    .header("x-application-name", "mobile")
-                    .header("x-req-id", UUID.randomUUID().toString())
-                    .POST(HttpRequest.BodyPublishers.ofString(requestBody))
-                    .build();
-
-            log.info("Отправляем POST запрос к: {}", API_URL);
-            HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
-
-            log.info("Статус ответа: {}", response.statusCode());
-
-            if (response.statusCode() == 200) {
-                log.info("✅ Успешно получены данные");
-                return response.body();
-            } else {
-                log.error("❌ Ошибка API: {}, тело: {}", response.statusCode(), response.body());
-                return null;
+    private Page findOrCreatePrematchPage(Browser browser) {
+        // Ищем существующую страницу с прематчем
+        for (BrowserContext context : browser.contexts()) {
+            for (Page page : context.pages()) {
+                String url = page.url();
+                if (url.contains("ligastavok.ru/prematch/") || url.contains("ligastavok.ru/line/")) {
+                    log.info("✅ Найдена прематч вкладка: {}", url);
+                    return page;
+                }
             }
-
-        } catch (Exception e) {
-            log.error("Ошибка при HTTP-запросе: {}", e.getMessage(), e);
-            return null;
         }
+
+        // Если не нашли, создаём новую страницу
+        Page newPage = browser.newPage();
+        newPage.navigate(BASE_URL + "/prematch/soccer");
+        newPage.waitForTimeout(3000);
+        log.info("🆕 Создана новая страница прематч");
+        return newPage;
     }
 
-    private List<RawEvent> parseEvents(String json) {
-        List<RawEvent> events = new ArrayList<>();
-        try {
-            JsonNode root = mapper.readTree(json);
-            JsonNode dataNode = root.path("result").path("data");
+    /**
+     * Настраивает перехват API-ответов для извлечения полных URL событий
+     */
+    private void setupApiInterceptor(Page page) {
+        // Перехватываем ответы от API
+        page.onResponse(response -> {
+            String url = response.url();
 
-            if (dataNode == null || !dataNode.isArray()) {
-                log.warn("Не найден массив data в result");
-                return events;
-            }
+            // Ищем API-запросы с данными о событиях
+            if (url.contains("/api/v2/") && url.contains("events")) {
+                log.debug("📡 Перехвачен API запрос: {}", url);
 
-            log.info("Найдено {} событий в ответе API", dataNode.size());
-
-            for (JsonNode eventNode : dataNode) {
                 try {
-                    RawEvent event = parseSingleEvent(eventNode);
-                    if (event != null && event.getHomeTeamName() != null && !event.getHomeTeamName().isEmpty()) {
-                        events.add(event);
+                    // API возвращает JSON
+                    String body = response.text();
+                    if (body != null && !body.isEmpty()) {
+                        parseEventUrlsFromApiJson(body);
                     }
                 } catch (Exception e) {
-                    log.debug("Ошибка парсинга одного события: {}", e.getMessage());
+                    log.warn("Ошибка парсинга API ответа: {}", e.getMessage());
                 }
             }
-
-            log.info("Успешно спарсено {} событий", events.size());
-
-        } catch (Exception e) {
-            log.error("Ошибка парсинга JSON: {}", e.getMessage(), e);
-        }
-        return events;
+        });
     }
 
-
-    private RawEvent parseSingleEvent(JsonNode eventNode) {
+    /**
+     * Извлекает правильные URL событий из JSON API
+     */
+    private void parseEventUrlsFromApiJson(String json) {
         try {
-            JsonNode eventInfo = eventNode.path("event");
+            JsonNode root = objectMapper.readTree(json);
 
-            String homeTeam = "";
-            String awayTeam = "";
+            // Ищем массив событий (структура зависит от API)
+            JsonNode events = findEventsArray(root);
+            if (events == null) return;
 
-            if (eventInfo.has("team1") && eventInfo.has("team2")) {
-                homeTeam = cleanTeamName(eventInfo.get("team1").asText());
-                awayTeam = cleanTeamName(eventInfo.get("team2").asText());
-            }
+            for (JsonNode eventNode : events) {
+                // Ищем ID события
+                String eventId = extractEventId(eventNode);
+                if (eventId == null) continue;
 
-            if (homeTeam.isEmpty() || awayTeam.isEmpty()) {
-                return null;
-            }
-
-            String eventId = String.valueOf(eventNode.path("id").asLong());
-            if (eventId.equals("0")) {
-                eventId = String.valueOf(eventNode.path("hash").asLong());
-            }
-
-            String league = eventInfo.path("topicTitle").asText();
-            String sport = eventNode.path("gameTitle").asText();
-
-            LocalDateTime startTime = LocalDateTime.now().plusDays(7);
-            long gameTs = eventNode.path("gameTs").asLong();
-            if (gameTs > 0) {
-                startTime = LocalDateTime.ofInstant(Instant.ofEpochMilli(gameTs), ZoneId.systemDefault());
-            }
-
-            // Парсим коэффициенты - ищем в разных местах
-            List<RawOutcome> outcomes = new ArrayList<>();
-
-            // Пробуем найти рынки
-            JsonNode marketsNode = null;
-
-            if (eventNode.has("markets") && eventNode.get("markets").isObject()) {
-                marketsNode = eventNode.get("markets");
-                log.debug("Нашли markets");
-            } else if (eventNode.has("factors") && eventNode.get("factors").isObject()) {
-                marketsNode = eventNode.get("factors");
-                log.debug("Нашли factors");
-            } else if (eventNode.has("odds") && eventNode.get("odds").isObject()) {
-                marketsNode = eventNode.get("odds");
-                log.debug("Нашли odds");
-            } else if (eventNode.has("outcomes") && eventNode.get("outcomes").isObject()) {
-                marketsNode = eventNode.get("outcomes");
-                log.debug("Нашли outcomes");
-            }
-
-            if (marketsNode != null) {
-                // Перебираем все возможные рынки
-                Iterator<Map.Entry<String, JsonNode>> fields = marketsNode.fields();
-                while (fields.hasNext()) {
-                    Map.Entry<String, JsonNode> entry = fields.next();
-                    JsonNode marketNode = entry.getValue();
-
-                    String marketType = marketNode.path("type").asText();
-                    log.debug("Найден рынок: type={}", marketType);
-
-                    // Ищем WIN или 1X2 рынок
-                    if ("WIN".equals(marketType) || "1X2".equals(marketType) || "CLASSIC".equals(marketType)) {
-                        String marketId = marketNode.path("id").asText();
-                        JsonNode outcomesNode = marketNode.path("outcomes");
-
-                        if (outcomesNode.isObject()) {
-                            Iterator<Map.Entry<String, JsonNode>> outcomeFields = outcomesNode.fields();
-                            while (outcomeFields.hasNext()) {
-                                Map.Entry<String, JsonNode> outcomeEntry = outcomeFields.next();
-                                JsonNode outcomeNode = outcomeEntry.getValue();
-
-                                String outcomeKey = outcomeNode.path("key").asText();
-                                double odds = outcomeNode.path("value").asDouble();
-
-                                if (odds > 0) {
-                                    String mappedType = null;
-                                    if ("1".equals(outcomeKey) || "HOME".equals(outcomeKey)) {
-                                        mappedType = "HOME";
-                                    } else if ("X".equals(outcomeKey) || "DRAW".equals(outcomeKey)) {
-                                        mappedType = "DRAW";
-                                    } else if ("2".equals(outcomeKey) || "AWAY".equals(outcomeKey)) {
-                                        mappedType = "AWAY";
-                                    }
-
-                                    if (mappedType != null) {
-                                        outcomes.add(RawOutcome.builder()
-                                                .externalMarketId(marketId)
-                                                .outcomeKeyName(mappedType)
-                                                .outcomeValueDescription("")
-                                                .odds(BigDecimal.valueOf(odds))
-                                                .isActive(true)
-                                                .build());
-                                    }
-                                }
-                            }
-                        }
-                        break;
-                    }
+                // Ищем URL события
+                String eventUrl = extractEventUrl(eventNode);
+                if (eventUrl != null && !eventUrl.isEmpty()) {
+                    // Сохраняем в кэш: externalId → полный URL
+                    String fullUrl = eventUrl.startsWith("http") ? eventUrl : BASE_URL + eventUrl;
+                    eventUrlCache.put(eventId, fullUrl);
+                    log.debug("📍 Найден URL для события {}: {}", eventId, fullUrl);
                 }
             }
 
-            // Если не нашли через markets, пробуем найти прямые коэффициенты в событии
-            if (outcomes.isEmpty()) {
-                log.debug("Пробуем найти прямые коэффициенты");
+            log.info("📦 Загружено {} URL событий из API", eventUrlCache.size());
 
-                // Проверяем наличие полей с коэффициентами
-                if (eventNode.has("coeff1") && eventNode.has("coeffX") && eventNode.has("coeff2")) {
-                    outcomes.add(RawOutcome.builder().externalMarketId("1X2").outcomeKeyName("HOME")
-                            .odds(BigDecimal.valueOf(eventNode.get("coeff1").asDouble())).isActive(true).build());
-                    outcomes.add(RawOutcome.builder().externalMarketId("1X2").outcomeKeyName("DRAW")
-                            .odds(BigDecimal.valueOf(eventNode.get("coeffX").asDouble())).isActive(true).build());
-                    outcomes.add(RawOutcome.builder().externalMarketId("1X2").outcomeKeyName("AWAY")
-                            .odds(BigDecimal.valueOf(eventNode.get("coeff2").asDouble())).isActive(true).build());
-                } else if (eventNode.has("odds1") && eventNode.has("oddsX") && eventNode.has("odds2")) {
-                    outcomes.add(RawOutcome.builder().externalMarketId("1X2").outcomeKeyName("HOME")
-                            .odds(BigDecimal.valueOf(eventNode.get("odds1").asDouble())).isActive(true).build());
-                    outcomes.add(RawOutcome.builder().externalMarketId("1X2").outcomeKeyName("DRAW")
-                            .odds(BigDecimal.valueOf(eventNode.get("oddsX").asDouble())).isActive(true).build());
-                    outcomes.add(RawOutcome.builder().externalMarketId("1X2").outcomeKeyName("AWAY")
-                            .odds(BigDecimal.valueOf(eventNode.get("odds2").asDouble())).isActive(true).build());
-                }
-            }
+        } catch (Exception e) {
+            log.warn("Ошибка парсинга API JSON: {}", e.getMessage());
+        }
+    }
 
-            if (outcomes.size() < 3) {
-                log.debug("Недостаточно исходов для {} - {}: {}", homeTeam, awayTeam, outcomes.size());
-                return null;
+    private JsonNode findEventsArray(JsonNode node) {
+        // Рекурсивно ищем массив с ключами "events" или "items"
+        if (node.isArray()) {
+            // Проверяем, что это массив событий (хотя бы один элемент имеет id)
+            if (node.size() > 0 && node.get(0).has("id")) {
+                return node;
             }
+        }
+
+        if (node.has("events")) return node.get("events");
+        if (node.has("items")) return node.get("items");
+        if (node.has("data")) return node.get("data");
+
+        // Рекурсивный поиск
+        Iterator<Map.Entry<String, JsonNode>> fields = node.fields();
+        while (fields.hasNext()) {
+            JsonNode child = fields.next().getValue();
+            JsonNode result = findEventsArray(child);
+            if (result != null) return result;
+        }
+
+        return null;
+    }
+
+    private String extractEventId(JsonNode eventNode) {
+        if (eventNode.has("id")) {
+            JsonNode idNode = eventNode.get("id");
+            if (idNode.isNumber()) return String.valueOf(idNode.asLong());
+            if (idNode.isTextual()) return idNode.asText();
+        }
+        return null;
+    }
+
+    private String extractEventUrl(JsonNode eventNode) {
+        // Проверяем разные возможные поля с URL
+        if (eventNode.has("url")) return eventNode.get("url").asText();
+        if (eventNode.has("link")) return eventNode.get("link").asText();
+        if (eventNode.has("href")) return eventNode.get("href").asText();
+
+        // У некоторых букмекеров URL строится из slug
+        if (eventNode.has("slug")) {
+            String slug = eventNode.get("slug").asText();
+            return "/sports/" + slug;
+        }
+
+        return null;
+    }
+
+    private List<RawEvent> parseEventsFromHtml(String html, Map<String, String> urlCache) {
+        List<RawEvent> events = new ArrayList<>();
+        Set<String> processed = new HashSet<>();
+
+        // Ищем карточки событий по data-t-event-id
+        Pattern cardPattern = Pattern.compile(
+                "<article[^>]*data-t-event-id=\"(\\d+)\"[^>]*>(.*?)</article>",
+                Pattern.DOTALL
+        );
+
+        Matcher cardMatcher = cardPattern.matcher(html);
+
+        while (cardMatcher.find()) {
+            String eventIdRaw = cardMatcher.group(1);
+            String cardHtml = cardMatcher.group(2);
+
+            String tournament = extractText(cardHtml, "event-card-title__text");
+            List<String> teams = extractTeams(cardHtml);
+            if (teams.size() < 2) continue;
+
+            String homeTeam = cleanTeamName(teams.get(0));
+            String awayTeam = cleanTeamName(teams.get(1));
+            String key = homeTeam + "_" + awayTeam;
+
+            if (processed.contains(key)) continue;
+
+            List<BigDecimal> odds = extractOdds(cardHtml);
+            if (odds.size() < 3) continue;
+
+            processed.add(key);
+
+            String eventId = "ls_" + eventIdRaw;
+            String marketId = eventId + "_1X2";
+
+            // ===== ИСПРАВЛЕННОЕ ФОРМИРОВАНИЕ URL =====
+            // Сначала проверяем кэш из API
+            String eventUrl = urlCache.get(eventIdRaw);
+
+            if (eventUrl == null) {
+                // Если в кэше нет — пробуем альтернативные способы
+                // Для футбола пытаемся построить URL из названий команд
+                eventUrl = buildUrlFromTeams(homeTeam, awayTeam, eventIdRaw);
+                log.warn("⚠️ URL не найден в API для ID {}, сформирован из команд: {}", eventIdRaw, eventUrl);
+            } else {
+                log.info("🔗 Использован API URL для события {}: {}", eventIdRaw, eventUrl);
+            }
+            // =======================================
+
+            List<RawOutcome> outcomes = Arrays.asList(
+                    RawOutcome.builder().externalMarketId(marketId).outcomeKeyName("HOME_WIN").outcomeValueDescription(homeTeam).odds(odds.get(0)).isActive(true).build(),
+                    RawOutcome.builder().externalMarketId(marketId).outcomeKeyName("DRAW").outcomeValueDescription("Ничья").odds(odds.get(1)).isActive(true).build(),
+                    RawOutcome.builder().externalMarketId(marketId).outcomeKeyName("AWAY_WIN").outcomeValueDescription(awayTeam).odds(odds.get(2)).isActive(true).build()
+            );
 
             RawMarket market = RawMarket.builder()
-                    .externalId("WIN_DRAW_WIN")
+                    .externalId(marketId)
                     .externalEventId(eventId)
                     .marketTypeName("WIN_DRAW_WIN")
                     .periodName("FULL_TIME")
@@ -278,45 +276,196 @@ public class LigaStavokAdapter implements BookmakerAdapter {
                     .build();
 
             RawEvent event = new RawEvent();
-            event.setExternalId("ligastavok_" + eventId);
+            event.setExternalId(eventId);
             event.setHomeTeamName(homeTeam);
             event.setAwayTeamName(awayTeam);
-            event.setStartTime(startTime);
-            event.setLeagueName(league);
-            event.setSportName(mapSport(sport));
+            event.setStartTime(LocalDateTime.now().plusHours(2));
+            event.setLeagueName(tournament.isEmpty() ? "Футбол" : tournament);
+            event.setSportName("Футбол");
+            event.setEventUrl(eventUrl);
             event.setMarkets(List.of(market));
 
-            log.info("✅ Спарсено: {} - {} (П1:{}, X:{}, П2:{})",
-                    homeTeam, awayTeam,
-                    outcomes.get(0).getOdds(),
-                    outcomes.get(1).getOdds(),
-                    outcomes.get(2).getOdds());
-
-            return event;
-
-        } catch (Exception e) {
-            log.error("Ошибка парсинга события: {}", e.getMessage(), e);
-            return null;
+            events.add(event);
+            log.info("✅ {} - {} | {} | {} | {} | URL: {}", tournament, homeTeam, awayTeam, odds.get(0), odds.get(1), odds.get(2), eventUrl);
         }
+
+        if (events.isEmpty()) {
+            log.info("🔄 Пробуем альтернативный парсинг...");
+            events = parseAlternative(html);
+        }
+
+        return events;
+    }
+
+    /**
+     * Формирует правильный URL для события на основе названий команд
+     * Формат: /sports/soccer/{slug}-id-{eventId}-service-id-26-ext-id-{extId}
+     */
+    private String buildUrlFromTeams(String homeTeam, String awayTeam, String eventIdRaw) {
+        // Создаём slug из названий команд
+        String slug = createSlug(homeTeam) + "-" + createSlug(awayTeam);
+        // ext-id можно получить из API, но если его нет — используем хеш
+        String extId = String.valueOf(Math.abs((homeTeam + awayTeam).hashCode()) % 1000000);
+
+        return BASE_URL + "/sports/soccer/" + slug + "-id-" + eventIdRaw + "-service-id-26-ext-id-" + extId;
+    }
+
+    /**
+     * Преобразует название команды в slug
+     */
+    private String createSlug(String teamName) {
+        if (teamName == null) return "";
+
+        String slug = teamName.toLowerCase()
+                .replaceAll("[^a-zа-яё\\s-]", "")  // оставляем буквы, пробелы и дефисы
+                .trim()
+                .replaceAll("\\s+", "-");          // пробелы → дефисы
+
+        // Транслитерация русских букв (упрощённая)
+        Map<Character, String> translit = new HashMap<>();
+        translit.put('а', "a"); translit.put('б', "b"); translit.put('в', "v");
+        translit.put('г', "g"); translit.put('д', "d"); translit.put('е', "e");
+        translit.put('ё', "e"); translit.put('ж', "zh"); translit.put('з', "z");
+        translit.put('и', "i"); translit.put('й', "y"); translit.put('к', "k");
+        translit.put('л', "l"); translit.put('м', "m"); translit.put('н', "n");
+        translit.put('о', "o"); translit.put('п', "p"); translit.put('р', "r");
+        translit.put('с', "s"); translit.put('т', "t"); translit.put('у', "u");
+        translit.put('ф', "f"); translit.put('х', "kh"); translit.put('ц', "ts");
+        translit.put('ч', "ch"); translit.put('ш', "sh"); translit.put('щ', "shch");
+        translit.put('ъ', ""); translit.put('ы', "y"); translit.put('ь', "");
+        translit.put('э', "e"); translit.put('ю', "yu"); translit.put('я', "ya");
+
+        StringBuilder result = new StringBuilder();
+        for (char c : slug.toCharArray()) {
+            if (translit.containsKey(c)) {
+                result.append(translit.get(c));
+            } else {
+                result.append(c);
+            }
+        }
+
+        return result.toString();
+    }
+
+    private String extractText(String html, String className) {
+        Pattern pattern = Pattern.compile("class=\"[^\"]*" + className + "[^\"]*\"[^>]*>([^<]+)</");
+        Matcher matcher = pattern.matcher(html);
+        return matcher.find() ? matcher.group(1).trim() : "";
+    }
+
+    private List<String> extractTeams(String html) {
+        List<String> teams = new ArrayList<>();
+        Pattern pattern = Pattern.compile("event-card-teams__team[^\"]*\"[^>]*>([^<]+)</div>");
+        Matcher matcher = pattern.matcher(html);
+        while (matcher.find() && teams.size() < 2) {
+            teams.add(matcher.group(1).trim());
+        }
+        return teams;
+    }
+
+    private List<BigDecimal> extractOdds(String cardHtml) {
+        List<BigDecimal> odds = new ArrayList<>();
+
+        // Ищем коэффициенты ТОЛЬКО для рынка WIN_DRAW_WIN
+        // Нужно искать секцию с "Основные пары" или "Исход матча"
+
+        // Временно: ограничить диапазон допустимых коэффициентов
+        Pattern pattern = Pattern.compile("(\\d+\\.\\d{2})");
+        Matcher matcher = pattern.matcher(cardHtml);
+
+        // Ищем коэффициенты, которые находятся РЯДОМ друг с другом
+        // и в разумном диапазоне (1.01 - 15.00)
+        while (matcher.find() && odds.size() < 3) {
+            try {
+                BigDecimal odd = new BigDecimal(matcher.group(1));
+                // Реалистичные коэффициенты для 1X2
+                if (odd.compareTo(new BigDecimal("1.01")) >= 0 &&
+                        odd.compareTo(new BigDecimal("15.00")) <= 0) {
+                    odds.add(odd);
+                }
+            } catch (Exception e) {}
+        }
+
+        return odds;
+    }
+
+
+    private List<RawEvent> parseAlternative(String html) {
+        List<RawEvent> events = new ArrayList<>();
+        Pattern pattern = Pattern.compile(
+                "([А-Я][а-я]+(?:\\s[А-Я][а-я]+)*)\\s*[-–]\\s*([А-Я][а-я]+(?:\\s[А-Я][а-я]+)*).*?(\\d+\\.\\d{2}).*?(\\d+\\.\\d{2}).*?(\\d+\\.\\d{2})",
+                Pattern.DOTALL
+        );
+        Matcher matcher = pattern.matcher(html);
+        Set<String> processed = new HashSet<>();
+
+        while (matcher.find()) {
+            String homeTeam = cleanTeamName(matcher.group(1));
+            String awayTeam = cleanTeamName(matcher.group(2));
+            String key = homeTeam + "_" + awayTeam;
+
+            if (processed.contains(key)) continue;
+            if (homeTeam.equals(awayTeam)) continue;
+            if (homeTeam.length() < 2 || awayTeam.length() < 2) continue;
+
+            try {
+                BigDecimal odd1 = new BigDecimal(matcher.group(3));
+                BigDecimal oddX = new BigDecimal(matcher.group(4));
+                BigDecimal odd2 = new BigDecimal(matcher.group(5));
+
+                processed.add(key);
+
+                String eventId = "ls_alt_" + System.currentTimeMillis() + "_" + Math.abs(key.hashCode());
+                String marketId = eventId + "_1X2";
+
+                // Для альтернативного парсинга пытаемся построить URL
+                String eventUrl = buildUrlFromTeams(homeTeam, awayTeam, String.valueOf(Math.abs(key.hashCode())));
+
+                List<RawOutcome> outcomes = Arrays.asList(
+                        RawOutcome.builder().externalMarketId(marketId).outcomeKeyName("HOME_WIN").odds(odd1).isActive(true).build(),
+                        RawOutcome.builder().externalMarketId(marketId).outcomeKeyName("DRAW").odds(oddX).isActive(true).build(),
+                        RawOutcome.builder().externalMarketId(marketId).outcomeKeyName("AWAY_WIN").odds(odd2).isActive(true).build()
+                );
+
+                RawMarket market = RawMarket.builder()
+                        .externalId(marketId)
+                        .externalEventId(eventId)
+                        .marketTypeName("WIN_DRAW_WIN")
+                        .periodName("FULL_TIME")
+                        .outcomes(outcomes)
+                        .build();
+
+                RawEvent event = new RawEvent();
+                event.setExternalId(eventId);
+                event.setHomeTeamName(homeTeam);
+                event.setAwayTeamName(awayTeam);
+                event.setStartTime(LocalDateTime.now().plusHours(2));
+                event.setLeagueName("Футбол");
+                event.setSportName("Футбол");
+                event.setEventUrl(eventUrl);
+                event.setMarkets(List.of(market));
+
+                events.add(event);
+                log.info("✅(alt) {} - {} | {} | {} | {} | URL: {}", homeTeam, awayTeam, odd1, oddX, odd2, eventUrl);
+
+            } catch (Exception e) {}
+        }
+
+        return events;
+    }
+
+    private void saveDebugHtml(String html) {
+        try {
+            java.nio.file.Files.writeString(java.nio.file.Paths.get("ligastavok_debug.html"), html);
+            log.info("💾 HTML сохранён в ligastavok_debug.html");
+        } catch (Exception e) {}
     }
 
     private String cleanTeamName(String name) {
         if (name == null) return "";
         return name.trim()
                 .replaceAll("\\s+", " ")
-                .replaceAll("[^\\p{L}\\p{N}\\s-]", "");
-    }
-
-    private String mapSport(String sport) {
-        if (sport == null) return "Футбол";
-        switch (sport.toLowerCase()) {
-            case "футбол": return "Футбол";
-            case "хоккей": return "Хоккей";
-            case "баскетбол": return "Баскетбол";
-            case "теннис": return "Теннис";
-            case "киберспорт": return "Киберспорт";
-            default: return sport;
-        }
+                .replaceAll("[^\\p{L}\\p{N}\\s]", "");
     }
 
     @Override

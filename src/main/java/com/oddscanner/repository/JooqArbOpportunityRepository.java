@@ -63,6 +63,17 @@ public class JooqArbOpportunityRepository implements ArbOpportunityRepository {
     }
 
     @Override
+    public List<ArbOpportunitiesRecord> findActiveWithEventDetails() {
+        return dsl.select(Tables.ARB_OPPORTUNITIES.fields())
+                .select(Tables.EVENTS.HOME_TEAM, Tables.EVENTS.AWAY_TEAM, Tables.EVENTS.EVENT_URL, Tables.EVENTS.START_TIME)
+                .from(Tables.ARB_OPPORTUNITIES)
+                .join(Tables.EVENTS).on(Tables.ARB_OPPORTUNITIES.EVENT_ID.eq(Tables.EVENTS.ID))
+                .where(Tables.ARB_OPPORTUNITIES.STATUS.eq("ACTIVE"))
+                .orderBy(Tables.ARB_OPPORTUNITIES.PROFIT_PCT.desc())
+                .fetchInto(ArbOpportunitiesRecord.class);
+    }
+
+    @Override
     public void updateStatus(Long id, String status) {
         OffsetDateTime now = OffsetDateTime.now(ZoneOffset.UTC);
         dsl.update(Tables.ARB_OPPORTUNITIES)

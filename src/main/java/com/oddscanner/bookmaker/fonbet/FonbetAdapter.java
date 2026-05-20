@@ -547,7 +547,7 @@ public class FonbetAdapter implements BookmakerAdapter {
         event.setStartTime(startTime != null ? startTime : LocalDateTime.now().plusDays(7));
         event.setLeagueName(league);
         event.setSportName(getSportName(eventNode));
-        event.setEventUrl(BASE_URL + "/live/football");
+        event.setEventUrl(BASE_URL + "/sport/football/" + eventId);
         event.setMarkets(markets);
 
         return event;

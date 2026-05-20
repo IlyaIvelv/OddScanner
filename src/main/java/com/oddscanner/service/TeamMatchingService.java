@@ -16,49 +16,53 @@ public class TeamMatchingService {
 
     private final DSLContext dsl;
 
-    public Integer findOrCreateCanonicalTeam(String teamName, String bookmakerCode) {
+    public Long findOrCreateCanonicalTeam(String teamName, String bookmakerCode) {
         if (teamName == null || teamName.isBlank()) return null;
 
+        // Временно отключаем, так как таблицы CANONICAL_TEAMS нет в БД
+        log.warn("TeamMatchingService временно отключен из-за отсутствия таблицы canonical_teams");
+        return null;
+
+        /* TODO: раскомментировать после создания таблиц canonical_teams
         // 1. Ищем алиас для этого букмекера
-        var aliasRecord = dsl.select(TEAM_ALIASES.CANONICAL_TEAM_ID)
+        var aliasRecord = dsl.select(TEAM_ALIASES.TEAM_ID)
                 .from(TEAM_ALIASES)
                 .where(TEAM_ALIASES.ALIAS.eq(teamName))
-                .and(TEAM_ALIASES.BOOKMAKER_CODE.eq(bookmakerCode))
+                .and(TEAM_ALIASES.BOOKMAKER_ID.eq(Long.parseLong(bookmakerCode)))
                 .fetchOne();
 
-        if (aliasRecord != null && aliasRecord.get(TEAM_ALIASES.CANONICAL_TEAM_ID) != null) {
-            return aliasRecord.get(TEAM_ALIASES.CANONICAL_TEAM_ID);
+        if (aliasRecord != null && aliasRecord.get(TEAM_ALIASES.TEAM_ID) != null) {
+            return aliasRecord.get(TEAM_ALIASES.TEAM_ID);
         }
 
-        // 2. Ищем существующую каноничную команду по названию
-        var existing = dsl.select(CANONICAL_TEAMS.ID)
-                .from(CANONICAL_TEAMS)
-                .where(CANONICAL_TEAMS.NAME.eq(teamName))
+        // 2. Ищем существующую команду в таблице teams
+        var existing = dsl.select(TEAMS.ID)
+                .from(TEAMS)
+                .where(TEAMS.NAME.eq(teamName))
                 .fetchOne();
 
-        Integer canonicalId;
+        Long canonicalId;
         if (existing != null) {
-            canonicalId = existing.get(CANONICAL_TEAMS.ID);
+            canonicalId = existing.get(TEAMS.ID);
         } else {
-            // 3. Создаём новую каноничную команду
-            canonicalId = dsl.insertInto(CANONICAL_TEAMS)
-                    .set(CANONICAL_TEAMS.NAME, teamName)
-                    .set(CANONICAL_TEAMS.CREATED_AT, LocalDateTime.now())
-                    .returning(CANONICAL_TEAMS.ID)
+            // 3. Создаём новую команду
+            canonicalId = dsl.insertInto(TEAMS)
+                    .set(TEAMS.NAME, teamName)
+                    .returning(TEAMS.ID)
                     .fetchOne()
-                    .get(CANONICAL_TEAMS.ID);
-            log.info("Создана новая каноничная команда: '{}' (ID: {})", teamName, canonicalId);
+                    .get(TEAMS.ID);
+            log.info("Создана новая команда: '{}' (ID: {})", teamName, canonicalId);
         }
 
         // 4. Сохраняем алиас для будущих матчей
         dsl.insertInto(TEAM_ALIASES)
                 .set(TEAM_ALIASES.ALIAS, teamName)
-                .set(TEAM_ALIASES.BOOKMAKER_CODE, bookmakerCode)
-                .set(TEAM_ALIASES.CANONICAL_TEAM_ID, canonicalId)
-                .set(TEAM_ALIASES.CREATED_AT, LocalDateTime.now())
+                .set(TEAM_ALIASES.BOOKMAKER_ID, Long.parseLong(bookmakerCode))
+                .set(TEAM_ALIASES.TEAM_ID, canonicalId)
                 .onDuplicateKeyIgnore()
                 .execute();
 
         return canonicalId;
+        */
     }
 }

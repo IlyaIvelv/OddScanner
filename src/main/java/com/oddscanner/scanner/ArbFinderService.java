@@ -1,14 +1,16 @@
 package com.oddscanner.scanner;
 
+import java.util.HashMap;
+import java.util.Map;
+import java.util.ArrayList;
+import java.util.List;
 import com.oddscanner.generated.Tables;
 import com.oddscanner.generated.tables.records.ArbLegsRecord;
 import com.oddscanner.generated.tables.records.ArbOpportunitiesRecord;
-import com.oddscanner.generated.tables.records.OutcomesRecord;
 import com.oddscanner.repository.ArbLegRepository;
 import com.oddscanner.repository.ArbOpportunityRepository;
-import com.oddscanner.repository.OutcomeRepository;
-import com.oddscanner.scanner.dto.ArbitrageOpportunityDTO;
-import com.oddscanner.scanner.dto.ArbLegDTO;
+import com.oddscanner.scanner.dto.ArbOpportunityWithDetailsDto;
+import com.oddscanner.scanner.dto.ArbOpportunityWithEventDto;
 import org.jooq.DSLContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -19,7 +21,6 @@ import java.math.BigDecimal;
 import java.math.MathContext;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
-import java.time.temporal.ChronoUnit;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -27,297 +28,444 @@ import java.util.stream.Collectors;
 public class ArbFinderService {
     private static final Logger log = LoggerFactory.getLogger(ArbFinderService.class);
     private static final MathContext MC = MathContext.DECIMAL128;
+    private static final BigDecimal MIN_PROFIT_PERCENT = new BigDecimal("0.5"); // 0.5% минимальная прибыль
 
     private final DSLContext dsl;
-    private final ArbCalculator arbCalculator;
-    private final OutcomeRepository outcomeRepo;
     private final ArbOpportunityRepository arbOpportunityRepo;
     private final ArbLegRepository arbLegRepo;
     private final ApplicationEventPublisher eventPublisher;
 
     public ArbFinderService(DSLContext dsl,
-                            ArbCalculator arbCalculator,
-                            OutcomeRepository outcomeRepo,
                             ArbOpportunityRepository arbOpportunityRepo,
                             ArbLegRepository arbLegRepo,
                             ApplicationEventPublisher eventPublisher) {
         this.dsl = dsl;
-        this.arbCalculator = arbCalculator;
-        this.outcomeRepo = outcomeRepo;
         this.arbOpportunityRepo = arbOpportunityRepo;
         this.arbLegRepo = arbLegRepo;
         this.eventPublisher = eventPublisher;
     }
 
-    private String normalizeTeamName(String name) {
-        if (name == null || name.isEmpty()) return "";
-
-        String original = name;
-        String normalized = name.toLowerCase()
-                .replaceAll("[^a-zа-я0-9\\s]", " ")
-                .replaceAll("\\s+", " ")
-                .trim();
-
-        // Убираем распространённые суффиксы и приставки
-        normalized = normalized.replaceAll("\\b(резерв|рез|reserve|res|u\\d{2}|до\\d{2}|мол|молодёжная|молодежная|юн|юношеская|юношеский|жен|женщины|женская)\\b", "")
-                .replaceAll("\\b(fc|cf|club|team|united|utd|city|real|atletico|inter|milan|barcelona|madrid|london|chelsea|liverpool|arsenal|manchester|man|juventus|roma|napoli|psg|bayern|dortmund|leipzig|ajax|porto|benfica|celtic|rangers|динамо|спартак|цска|локомотив|зенит|краснодар|ростов|ахмат|урал|крыльясоветов)\\b", "")
-                .replaceAll("\\s+", " ")
-                .trim();
-
-        // Убираем слова в скобках
-        normalized = normalized.replaceAll("\\s*\\([^)]*\\)\\s*", " ");
-
-        // Убираем тире и точки
-        normalized = normalized.replaceAll("[-.]", " ");
-
-        // Убираем номера команд (1, 2, 3, II, III)
-        normalized = normalized.replaceAll("\\b[ivxlcdm]+\\b", "")
-                .replaceAll("\\b\\d+\\b", " ");
-
-        // Сокращаем множественные пробелы
-        normalized = normalized.replaceAll("\\s+", " ").trim();
-
-        log.debug("Нормализация: '{}' -> '{}'", original, normalized);
-        return normalized;
-    }
-
-    private boolean isSameTeam(String team1, String team2) {
-        if (team1 == null || team2 == null) return false;
-        String norm1 = normalizeTeamName(team1);
-        String norm2 = normalizeTeamName(team2);
-        if (norm1.isEmpty() || norm2.isEmpty()) return false;
-        return norm1.equals(norm2) || norm1.contains(norm2) || norm2.contains(norm1);
-    }
-
-    private boolean isSameMatch(String home1, String away1, String home2, String away2) {
-        return (isSameTeam(home1, home2) && isSameTeam(away1, away2)) ||
-                (isSameTeam(home1, away2) && isSameTeam(away1, home2));
-    }
-
     /**
-     * Главный метод поиска вилок между букмекерами (по сырым названиям команд)
+     * Главный метод поиска вилок
      */
-    public void scanCrossBookmakerArbitrage() {
-        log.info("=== НАЧАЛО ПОИСКА ВИЛОК МЕЖДУ БУКМЕКЕРАМИ (по сырым названиям) ===");
+    public void scanForArbitrage() {
+        log.info("=== ЗАПУСК СКАНЕРА ВИЛОК ===");
 
-        var sql = dsl.select(
+        // 1. Получаем все активные исходы с информацией о рынках и событиях
+        var outcomes = dsl.select(
                         Tables.OUTCOMES.ID.as("outcome_id"),
                         Tables.OUTCOMES.MARKET_ID,
                         Tables.OUTCOMES.OUTCOME_KEY,
                         Tables.OUTCOMES.ODDS,
-                        Tables.OUTCOMES.IS_ACTIVE,
                         Tables.MARKETS.EVENT_ID,
-                        Tables.MARKETS.BOOKMAKER_ID,
                         Tables.MARKETS.MARKET_TYPE,
+                        Tables.MARKETS.PERIOD,
+                        Tables.MARKETS.BOOKMAKER_ID,
                         Tables.BOOKMAKERS.CODE.as("bookmaker_code"),
-                        Tables.BOOKMAKERS.NAME.as("bookmaker_name"),
-                        Tables.EVENTS.START_TIME,
-                        Tables.EVENTS.HOME_TEAM,
-                        Tables.EVENTS.AWAY_TEAM
+                        Tables.BOOKMAKERS.NAME.as("bookmaker_name")
                 )
                 .from(Tables.OUTCOMES)
                 .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))
-                .join(Tables.EVENTS).on(Tables.MARKETS.EVENT_ID.eq(Tables.EVENTS.ID))
                 .join(Tables.BOOKMAKERS).on(Tables.MARKETS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
                 .where(Tables.OUTCOMES.IS_ACTIVE.isTrue())
                 .fetch();
 
-        log.info("Найдено {} активных исходов для анализа", sql.size());
+        log.info("Найдено {} активных исходов для анализа", outcomes.size());
 
-        if (sql.isEmpty()) {
+        if (outcomes.isEmpty()) {
             log.warn("Нет активных исходов");
             return;
         }
 
-        // Группируем по сырым названиям команд
-        Map<String, List<Map<String, Object>>> eventsGroup = new HashMap<>();
+        // 2. Группируем по (event_id, market_type, period)
+        Map<String, List<Map<String, Object>>> groups = new HashMap<>();
 
-        for (var record : sql) {
-            String homeTeam = record.get(Tables.EVENTS.HOME_TEAM);
-            String awayTeam = record.get(Tables.EVENTS.AWAY_TEAM);
-            OffsetDateTime startTime = record.get(Tables.EVENTS.START_TIME);
+        for (var record : outcomes) {
+            Long eventId = record.get(Tables.MARKETS.EVENT_ID);
+            String marketType = record.get(Tables.MARKETS.MARKET_TYPE);
+            String period = record.get(Tables.MARKETS.PERIOD);
+            if (period == null) period = "";
 
-            if (homeTeam == null || awayTeam == null) continue;
-
-            String normHome = normalizeTeamName(homeTeam);
-            String normAway = normalizeTeamName(awayTeam);
-
-            if (normHome.isEmpty() || normAway.isEmpty()) continue;
-
-            String key = normHome.compareTo(normAway) < 0 ?
-                    normHome + "_" + normAway : normAway + "_" + normHome;
-
-            log.debug("Ключ матча: {} -> {} vs {} ({} / {})", key, homeTeam, awayTeam, normHome, normAway);
-
-            eventsGroup.computeIfAbsent(key, k -> new ArrayList<>()).add(record.intoMap());
+            String key = eventId + "_" + marketType + "_" + period;
+            groups.computeIfAbsent(key, k -> new ArrayList<>()).add(record.intoMap());
         }
 
-        log.info("Найдено {} уникальных матчей (по сырым названиям)", eventsGroup.size());
+        log.info("Групп для анализа: {}", groups.size());
 
         int arbCount = 0;
-        for (List<Map<String, Object>> outcomes : eventsGroup.values()) {
-            // Группируем по market_type + outcome_key
-            Map<String, Map<String, Object>> bestOutcomes = new HashMap<>();
+        for (List<Map<String, Object>> group : groups.values()) {
+            // Быстрая проверка: есть ли в группе хотя бы 2 разных букмекера
+            Set<String> bookmakersInGroup = group.stream()
+                    .map(o -> (String) o.get("bookmaker_code"))
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toSet());
 
-            Map<String, List<Map<String, Object>>> byMarketAndOutcome = outcomes.stream()
-                    .collect(Collectors.groupingBy(o -> o.get("market_type") + "_" + o.get("outcome_key")));
-
-            for (Map.Entry<String, List<Map<String, Object>>> entry : byMarketAndOutcome.entrySet()) {
-                Map<String, Object> best = null;
-                BigDecimal bestOdd = BigDecimal.ZERO;
-
-                for (Map<String, Object> outcome : entry.getValue()) {
-                    BigDecimal odds = (BigDecimal) outcome.get("odds");
-                    if (odds.compareTo(bestOdd) > 0) {
-                        bestOdd = odds;
-                        best = outcome;
-                    }
-                }
-
-                if (best != null) {
-                    String key = (String) best.get("outcome_key");
-                    bestOutcomes.put(key, best);
-                }
+            if (bookmakersInGroup.size() < 2) {
+                log.debug("Группа пропущена: только {} (нет вилки между разными БК)", bookmakersInGroup);
+                continue;
             }
 
-            if (bestOutcomes.size() >= 2) {
-                if (checkAndSaveArbitrage(bestOutcomes)) {
-                    arbCount++;
-                }
+            if (checkAndSaveArbitrage(group)) {
+                arbCount++;
             }
         }
 
         log.info("=== ПОИСК ВИЛОК ЗАВЕРШЕН, найдено {} вилок ===", arbCount);
     }
 
-    private boolean checkAndSaveArbitrage(Map<String, Map<String, Object>> outcomes) {
-        List<Map<String, Object>> outcomeList = new ArrayList<>(outcomes.values());
+    /**
+     * Проверяет группу исходов на наличие вилки и сохраняет
+     */
+    private boolean checkAndSaveArbitrage(List<Map<String, Object>> outcomes) {
+        if (outcomes.size() < 2) return false;
 
+        // 1. Группируем по outcome_key и выбираем максимальный коэффициент
+        Map<String, Map<String, Object>> bestOutcomes = new HashMap<>();
+
+        Map<String, List<Map<String, Object>>> byOutcomeKey = outcomes.stream()
+                .collect(Collectors.groupingBy(o -> (String) o.get("outcome_key")));
+
+        for (Map.Entry<String, List<Map<String, Object>>> entry : byOutcomeKey.entrySet()) {
+            Map<String, Object> best = null;
+            BigDecimal bestOdds = BigDecimal.ZERO;
+
+            for (Map<String, Object> outcome : entry.getValue()) {
+                BigDecimal odds = (BigDecimal) outcome.get("odds");
+                if (odds.compareTo(bestOdds) > 0) {
+                    bestOdds = odds;
+                    best = outcome;
+                }
+            }
+            if (best != null) {
+                bestOutcomes.put(entry.getKey(), best);
+            }
+        }
+
+        // 2. ПРОВЕРКА: исходы из разных букмекеров
+        Set<String> bookmakerCodes = new HashSet<>();
+        for (Map<String, Object> outcome : bestOutcomes.values()) {
+            String bookmakerCode = (String) outcome.get("bookmaker_code");
+            if (bookmakerCode != null) {
+                bookmakerCodes.add(bookmakerCode);
+            }
+        }
+
+        // Если все исходы из одного букмекера — это не реализуемая вилка
+        if (bookmakerCodes.size() < 2) {
+            log.debug("❌ Вилка отклонена: все исходы из одного букмекера ({})",
+                    bookmakerCodes.iterator().next());
+            return false;
+        }
+
+        log.info("🔍 Потенциальная вилка из {} букмекеров: {}", bookmakerCodes.size(), bookmakerCodes);
+
+        // 3. Для рынка WIN_DRAW_WIN нужно 3 исхода
+        String marketType = (String) outcomes.get(0).get("market_type");
+        if ("WIN_DRAW_WIN".equals(marketType) && bestOutcomes.size() < 3) {
+            log.debug("Недостаточно исходов для WIN_DRAW_WIN: {}", bestOutcomes.size());
+            return false;
+        }
+
+        // 4. Сортируем исходы в порядке HOME_WIN, DRAW, AWAY_WIN для читаемости
+        List<Map<String, Object>> sortedOutcomes = new ArrayList<>(bestOutcomes.values());
+        if ("WIN_DRAW_WIN".equals(marketType)) {
+            sortedOutcomes.sort(Comparator.comparing(o -> {
+                String key = (String) o.get("outcome_key");
+                if ("HOME_WIN".equals(key)) return 0;
+                if ("DRAW".equals(key)) return 1;
+                if ("AWAY_WIN".equals(key)) return 2;
+                return 3;
+            }));
+        }
+
+        // 5. Рассчитываем сумму обратных величин
         BigDecimal inverseSum = BigDecimal.ZERO;
-        for (Map<String, Object> outcome : outcomeList) {
+        for (Map<String, Object> outcome : sortedOutcomes) {
             BigDecimal odds = (BigDecimal) outcome.get("odds");
             inverseSum = inverseSum.add(BigDecimal.ONE.divide(odds, MC));
         }
 
+        // 6. Проверяем, есть ли вилка (сумма < 1)
         if (inverseSum.compareTo(BigDecimal.ONE) >= 0) {
             return false;
         }
 
+        // 7. Рассчитываем прибыль
         BigDecimal profitPct = BigDecimal.ONE.subtract(inverseSum).multiply(BigDecimal.valueOf(100));
 
-        if (profitPct.compareTo(new BigDecimal("0.1")) < 0) {
+        if (profitPct.compareTo(MIN_PROFIT_PERCENT) < 0) {
+            log.debug("Прибыль {}% ниже минимальной {}%", profitPct, MIN_PROFIT_PERCENT);
             return false;
         }
 
-        Long eventId = ((Integer) outcomeList.get(0).get("event_id")).longValue();
-        String marketType = (String) outcomeList.get(0).get("market_type");
-        String marketSignature = eventId + "_" + marketType + "_" + UUID.randomUUID().toString().substring(0, 8);
+        // 8. Получаем информацию о событии
+        Long eventId = getLongValue(sortedOutcomes.get(0).get("event_id"));
+        String marketSignature = eventId + "_" + marketType + "_" + System.currentTimeMillis();
 
+        // 9. Проверяем, не существовала ли уже активная вилка для этого события
         var existing = arbOpportunityRepo.findByEventIdAndMarketSignature(eventId, marketSignature);
         if (existing.isPresent()) {
+            log.debug("Вилка для события {} уже существует, пропускаем", eventId);
             return false;
         }
 
-        String homeTeam = (String) outcomeList.get(0).get("home_team");
-        String awayTeam = (String) outcomeList.get(0).get("away_team");
+        // 10. Рассчитываем суммы ставок
+        BigDecimal totalStake = new BigDecimal("100");
+        BigDecimal guaranteedReturn = totalStake.divide(inverseSum, MC);
+        BigDecimal profitAmount = guaranteedReturn.subtract(totalStake);
 
+        // 11. Сохраняем вилку
         ArbOpportunitiesRecord opportunity = new ArbOpportunitiesRecord();
         opportunity.setEventId(eventId);
         opportunity.setMarketSignature(marketSignature);
         opportunity.setProfitPct(profitPct);
         opportunity.setFoundAt(OffsetDateTime.now(ZoneOffset.UTC));
         opportunity.setStatus("ACTIVE");
+        opportunity.setTotalStake(totalStake);
+        opportunity.setGuaranteedReturn(guaranteedReturn);
+        opportunity.setProfitAmount(profitAmount);
 
         var saved = arbOpportunityRepo.save(opportunity);
 
-        log.info("!!! НАЙДЕНА ВИЛКА !!! {} vs {}: Прибыль {}%", homeTeam, awayTeam, profitPct);
+        // Логируем найденную вилку
+        log.info("!!! НАЙДЕНА ВИЛКА !!! Event ID: {}, Прибыль: {}%", eventId, profitPct);
+        log.info("   Обратная сумма: {} | Гарантированный возврат: {} | Прибыль: {}",
+                inverseSum, guaranteedReturn, profitAmount);
 
-        for (Map<String, Object> outcome : outcomeList) {
+        // 12. Сохраняем ноги (лега)
+        for (Map<String, Object> outcome : sortedOutcomes) {
             BigDecimal odds = (BigDecimal) outcome.get("odds");
             BigDecimal stakeShare = BigDecimal.ONE.divide(odds, MC).divide(inverseSum, MC);
+            BigDecimal stakeAmount = totalStake.multiply(stakeShare, MC);
+
+            Long bookmakerId = getLongValue(outcome.get("bookmaker_id"));
+            Long marketId = getLongValue(outcome.get("market_id"));
+            Long outcomeId = getLongValue(outcome.get("outcome_id"));
+
+            if (bookmakerId == null || marketId == null || outcomeId == null) {
+                log.error("Пропуск ноги: не удалось получить ID");
+                continue;
+            }
 
             ArbLegsRecord leg = new ArbLegsRecord();
             leg.setArbId(saved.getId());
-            leg.setBookmakerId(((Integer) outcome.get("bookmaker_id")).longValue());
-            leg.setMarketId(((Integer) outcome.get("market_id")).longValue());
-            leg.setOutcomeId(((Integer) outcome.get("outcome_id")).longValue());
+            leg.setBookmakerId(bookmakerId);
+            leg.setMarketId(marketId);
+            leg.setOutcomeId(outcomeId);
             leg.setOdds(odds);
             leg.setStakeShare(stakeShare);
+            leg.setStakeAmount(stakeAmount);
 
             arbLegRepo.save(leg);
 
-            log.info("  Нога: {} ({}) - коэф {}, доля {}%",
+            log.info("  Нога: {} ({}) - коэф {}, ставка {:.2f}, доля {:.2f}%",
                     outcome.get("outcome_key"),
                     outcome.get("bookmaker_code"),
                     odds,
-                    stakeShare.multiply(BigDecimal.valueOf(100)).setScale(2, java.math.RoundingMode.HALF_UP));
+                    stakeAmount,
+                    stakeShare.multiply(BigDecimal.valueOf(100)));
         }
 
         eventPublisher.publishEvent(new ArbitrageFoundEvent(null));
         return true;
     }
 
-    public void scanForArbitrage() {
-        log.info("Starting arbitrage scan...");
-        List<OutcomesRecord> allActiveOutcomes = dsl.selectFrom(Tables.OUTCOMES)
-                .where(Tables.OUTCOMES.IS_ACTIVE.isTrue())
-                .fetchInto(OutcomesRecord.class);
-        log.info("Scanning {} active outcomes...", allActiveOutcomes.size());
-
-        Map<Long, List<OutcomesRecord>> groupedOutcomes = allActiveOutcomes.stream()
-                .collect(Collectors.groupingBy(OutcomesRecord::getMarketId));
-
-        for (Map.Entry<Long, List<OutcomesRecord>> entry : groupedOutcomes.entrySet()) {
-            var opportunityOpt = arbCalculator.calculateArbitrage(entry.getValue());
-            opportunityOpt.ifPresent(this::handleArbitrageOpportunity);
-        }
-        log.info("Arbitrage scan completed.");
+    private Long getLongValue(Object obj) {
+        if (obj == null) return null;
+        if (obj instanceof Long) return (Long) obj;
+        if (obj instanceof Integer) return ((Integer) obj).longValue();
+        if (obj instanceof Number) return ((Number) obj).longValue();
+        return null;
     }
 
     public void triggerScan() {
-        log.info("=== ЗАПУСК СКАНЕРА ВИЛОК ===");
-        scanCrossBookmakerArbitrage();
-        log.info("=== СКАНЕР ВИЛОК ЗАВЕРШИЛ РАБОТУ ===");
+        scanForArbitrage();
     }
 
-    private void handleArbitrageOpportunity(ArbitrageOpportunityDTO opportunity) {
-        log.info("Arbitrage opportunity detected: Profit {}%", opportunity.getProfitPercentage());
-        var existing = arbOpportunityRepo.findByEventIdAndMarketSignature(
-                opportunity.getEventId(), opportunity.getMarketSignature());
-        if (existing.isPresent()) return;
+    public List<ArbOpportunityWithEventDto> getActiveArbsWithDetails() {
+        // Получаем активные вилки с данными событий
+        var records = dsl.select(
+                        Tables.ARB_OPPORTUNITIES.ID,
+                        Tables.ARB_OPPORTUNITIES.EVENT_ID,
+                        Tables.ARB_OPPORTUNITIES.PROFIT_PCT,
+                        Tables.ARB_OPPORTUNITIES.STATUS,
+                        Tables.ARB_OPPORTUNITIES.FOUND_AT,
+                        Tables.EVENTS.HOME_TEAM,
+                        Tables.EVENTS.AWAY_TEAM,
+                        Tables.EVENTS.EVENT_URL,
+                        Tables.EVENTS.START_TIME
+                )
+                .from(Tables.ARB_OPPORTUNITIES)
+                .join(Tables.EVENTS).on(Tables.ARB_OPPORTUNITIES.EVENT_ID.eq(Tables.EVENTS.ID))
+                .where(Tables.ARB_OPPORTUNITIES.STATUS.eq("ACTIVE"))
+                .orderBy(Tables.ARB_OPPORTUNITIES.PROFIT_PCT.desc())
+                .fetch();
 
-        var record = new ArbOpportunitiesRecord();
-        record.setEventId(opportunity.getEventId());
-        record.setMarketSignature(opportunity.getMarketSignature());
-        record.setProfitPct(opportunity.getProfitPercentage());
-        record.setFoundAt(opportunity.getFoundAt().atOffset(ZoneOffset.UTC));
-        record.setStatus("ACTIVE");
-        var saved = arbOpportunityRepo.save(record);
+        List<ArbOpportunityWithEventDto> result = new ArrayList<>();
 
-        for (ArbLegDTO leg : opportunity.getLegs()) {
-            var legRecord = new ArbLegsRecord();
-            legRecord.setArbId(saved.getId());
-            legRecord.setBookmakerId(findBookmakerIdByOutcomeId(leg.getOutcomeId()));
-            legRecord.setMarketId(leg.getMarketId());
-            legRecord.setOutcomeId(leg.getOutcomeId());
-            legRecord.setOdds(leg.getOdds());
-            legRecord.setStakeShare(leg.getStakeShare());
-            arbLegRepo.save(legRecord);
+        for (var record : records) {
+            ArbOpportunityWithEventDto dto = new ArbOpportunityWithEventDto();
+            dto.setId(record.get(Tables.ARB_OPPORTUNITIES.ID));
+            dto.setEventId(record.get(Tables.ARB_OPPORTUNITIES.EVENT_ID));
+            dto.setProfitPct(record.get(Tables.ARB_OPPORTUNITIES.PROFIT_PCT));
+            dto.setStatus(record.get(Tables.ARB_OPPORTUNITIES.STATUS));
+            dto.setFoundAt(record.get(Tables.ARB_OPPORTUNITIES.FOUND_AT));
+            dto.setHomeTeam(record.get(Tables.EVENTS.HOME_TEAM));
+            dto.setAwayTeam(record.get(Tables.EVENTS.AWAY_TEAM));
+            dto.setEventUrl(record.get(Tables.EVENTS.EVENT_URL));
+            dto.setStartTime(record.get(Tables.EVENTS.START_TIME));
+
+            // Получаем ноги вилки
+            var legs = dsl.select(
+                            Tables.ARB_LEGS.BOOKMAKER_ID,
+                            Tables.BOOKMAKERS.CODE,
+                            Tables.BOOKMAKERS.NAME,
+                            Tables.OUTCOMES.OUTCOME_KEY,
+                            Tables.ARB_LEGS.ODDS,
+                            Tables.ARB_LEGS.STAKE_SHARE,
+                            Tables.ARB_LEGS.STAKE_AMOUNT
+                    )
+                    .from(Tables.ARB_LEGS)
+                    .join(Tables.BOOKMAKERS).on(Tables.ARB_LEGS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
+                    .join(Tables.OUTCOMES).on(Tables.ARB_LEGS.OUTCOME_ID.eq(Tables.OUTCOMES.ID))
+                    .where(Tables.ARB_LEGS.ARB_ID.eq(dto.getId()))
+                    .fetch();
+
+            List<ArbOpportunityWithEventDto.ArbLegDto> legDtos = new ArrayList<>();
+            for (var leg : legs) {
+                ArbOpportunityWithEventDto.ArbLegDto legDto = new ArbOpportunityWithEventDto.ArbLegDto();
+                legDto.setBookmakerId(leg.get(Tables.ARB_LEGS.BOOKMAKER_ID));
+                legDto.setBookmakerCode(leg.get(Tables.BOOKMAKERS.CODE));
+                legDto.setBookmakerName(leg.get(Tables.BOOKMAKERS.NAME));
+                legDto.setOutcomeKey(leg.get(Tables.OUTCOMES.OUTCOME_KEY));
+                legDto.setOdds(leg.get(Tables.ARB_LEGS.ODDS));
+                legDto.setStakeShare(leg.get(Tables.ARB_LEGS.STAKE_SHARE));
+                legDto.setStakeAmount(leg.get(Tables.ARB_LEGS.STAKE_AMOUNT));
+                legDtos.add(legDto);
+            }
+            dto.setLegs(legDtos);
+            result.add(dto);
         }
-        eventPublisher.publishEvent(new ArbitrageFoundEvent(opportunity));
-    }
 
-    private Long findBookmakerIdByOutcomeId(Long outcomeId) {
-        return dsl.select(Tables.MARKETS.BOOKMAKER_ID)
-                .from(Tables.OUTCOMES)
-                .join(Tables.MARKETS).on(Tables.OUTCOMES.MARKET_ID.eq(Tables.MARKETS.ID))
-                .where(Tables.OUTCOMES.ID.eq(outcomeId))
-                .fetchOneInto(Long.class);
+        return result;
     }
 
     public List<Map<String, Object>> getArbsWithDetails() {
         List<Map<String, Object>> result = new ArrayList<>();
-        // Ваш существующий код получения вилок с деталями
+
+        var arbs = dsl.selectFrom(Tables.ARB_OPPORTUNITIES)
+                .where(Tables.ARB_OPPORTUNITIES.STATUS.eq("ACTIVE"))
+                .orderBy(Tables.ARB_OPPORTUNITIES.FOUND_AT.desc())
+                .fetch();
+
+        for (var arb : arbs) {
+            Map<String, Object> arbMap = new HashMap<>();
+            arbMap.put("id", arb.getId());
+            arbMap.put("eventId", arb.getEventId());
+            arbMap.put("profitPct", arb.getProfitPct());
+            arbMap.put("foundAt", arb.getFoundAt());
+            arbMap.put("status", arb.getStatus());
+
+            // Получаем ноги для этой вилки
+            var legs = dsl.select(
+                            Tables.ARB_LEGS.ODDS,
+                            Tables.ARB_LEGS.STAKE_SHARE,
+                            Tables.ARB_LEGS.STAKE_AMOUNT,
+                            Tables.BOOKMAKERS.CODE,
+                            Tables.BOOKMAKERS.NAME,
+                            Tables.OUTCOMES.OUTCOME_KEY
+                    )
+                    .from(Tables.ARB_LEGS)
+                    .join(Tables.BOOKMAKERS).on(Tables.ARB_LEGS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
+                    .join(Tables.OUTCOMES).on(Tables.ARB_LEGS.OUTCOME_ID.eq(Tables.OUTCOMES.ID))
+                    .where(Tables.ARB_LEGS.ARB_ID.eq(arb.getId()))
+                    .fetch();
+
+            List<Map<String, Object>> legList = new ArrayList<>();
+            for (var leg : legs) {
+                Map<String, Object> legMap = new HashMap<>();
+                legMap.put("odds", leg.get(Tables.ARB_LEGS.ODDS));
+                legMap.put("stakeShare", leg.get(Tables.ARB_LEGS.STAKE_SHARE));
+                legMap.put("stakeAmount", leg.get(Tables.ARB_LEGS.STAKE_AMOUNT));
+                legMap.put("bookmakerCode", leg.get(Tables.BOOKMAKERS.CODE));
+                legMap.put("bookmakerName", leg.get(Tables.BOOKMAKERS.NAME));
+                legMap.put("outcomeKey", leg.get(Tables.OUTCOMES.OUTCOME_KEY));
+                legList.add(legMap);
+            }
+            arbMap.put("legs", legList);
+            result.add(arbMap);
+        }
+
+        return result;
+    }
+
+    // ArbFinderService.java
+    public List<ArbOpportunityWithDetailsDto> getActiveArbsWithEventDetails() {
+        List<ArbOpportunityWithDetailsDto> result = new ArrayList<>();
+
+        var records = dsl.select(
+                        Tables.ARB_OPPORTUNITIES.ID,
+                        Tables.ARB_OPPORTUNITIES.EVENT_ID,
+                        Tables.ARB_OPPORTUNITIES.PROFIT_PCT,
+                        Tables.ARB_OPPORTUNITIES.STATUS,
+                        Tables.ARB_OPPORTUNITIES.FOUND_AT,
+                        Tables.EVENTS.HOME_TEAM,
+                        Tables.EVENTS.AWAY_TEAM,
+                        Tables.EVENTS.EVENT_URL,
+                        Tables.EVENTS.START_TIME,
+                        Tables.LEAGUES.NAME.as("league_name")
+                )
+                .from(Tables.ARB_OPPORTUNITIES)
+                .join(Tables.EVENTS).on(Tables.ARB_OPPORTUNITIES.EVENT_ID.eq(Tables.EVENTS.ID))
+                .leftJoin(Tables.LEAGUES).on(Tables.EVENTS.LEAGUE_ID.eq(Tables.LEAGUES.ID))
+                .where(Tables.ARB_OPPORTUNITIES.STATUS.eq("ACTIVE"))
+                .orderBy(Tables.ARB_OPPORTUNITIES.PROFIT_PCT.desc())
+                .fetch();
+
+        for (var record : records) {
+            ArbOpportunityWithDetailsDto dto = new ArbOpportunityWithDetailsDto();
+            dto.setId(record.get(Tables.ARB_OPPORTUNITIES.ID));
+            dto.setEventId(record.get(Tables.ARB_OPPORTUNITIES.EVENT_ID));
+            dto.setProfitPercentage(record.get(Tables.ARB_OPPORTUNITIES.PROFIT_PCT));
+            dto.setStatus(record.get(Tables.ARB_OPPORTUNITIES.STATUS));
+            dto.setFoundAt(record.get(Tables.ARB_OPPORTUNITIES.FOUND_AT));
+            dto.setHomeTeam(record.get(Tables.EVENTS.HOME_TEAM));
+            dto.setAwayTeam(record.get(Tables.EVENTS.AWAY_TEAM));
+            dto.setEventUrl(record.get(Tables.EVENTS.EVENT_URL));
+            dto.setStartTime(record.get(Tables.EVENTS.START_TIME));
+            dto.setLeagueName(record.get("league_name", String.class));
+
+            // Получаем ноги вилки
+            var legs = dsl.select(
+                            Tables.BOOKMAKERS.CODE,
+                            Tables.BOOKMAKERS.NAME,
+                            Tables.OUTCOMES.OUTCOME_KEY,
+                            Tables.ARB_LEGS.ODDS,
+                            Tables.ARB_LEGS.STAKE_SHARE,
+                            Tables.ARB_LEGS.STAKE_AMOUNT
+                    )
+                    .from(Tables.ARB_LEGS)
+                    .join(Tables.BOOKMAKERS).on(Tables.ARB_LEGS.BOOKMAKER_ID.eq(Tables.BOOKMAKERS.ID))
+                    .join(Tables.OUTCOMES).on(Tables.ARB_LEGS.OUTCOME_ID.eq(Tables.OUTCOMES.ID))
+                    .where(Tables.ARB_LEGS.ARB_ID.eq(dto.getId()))
+                    .fetch();
+
+            List<ArbOpportunityWithDetailsDto.ArbLegDetailsDto> legDtos = new ArrayList<>();
+            for (var leg : legs) {
+                ArbOpportunityWithDetailsDto.ArbLegDetailsDto legDto =
+                        new ArbOpportunityWithDetailsDto.ArbLegDetailsDto();
+                legDto.setBookmakerCode(leg.get(Tables.BOOKMAKERS.CODE));
+                legDto.setBookmakerName(leg.get(Tables.BOOKMAKERS.NAME));
+                legDto.setOutcomeKey(leg.get(Tables.OUTCOMES.OUTCOME_KEY));
+                legDto.setOdds(leg.get(Tables.ARB_LEGS.ODDS));
+                legDto.setStakeShare(leg.get(Tables.ARB_LEGS.STAKE_SHARE));
+                legDto.setStakeAmount(leg.get(Tables.ARB_LEGS.STAKE_AMOUNT));
+                legDtos.add(legDto);
+            }
+            dto.setLegs(legDtos);
+            result.add(dto);
+        }
+
         return result;
     }
 }

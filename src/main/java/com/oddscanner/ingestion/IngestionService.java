@@ -24,8 +24,9 @@ import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
-import java.time.Duration;
 
+import java.math.BigDecimal;
+import java.time.Duration;
 import java.time.LocalDateTime;
 import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
@@ -34,6 +35,8 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.stream.Collectors;
+
+import static com.oddscanner.generated.tables.Teams.TEAMS;
 
 @Service
 public class IngestionService {
@@ -56,7 +59,7 @@ public class IngestionService {
     public IngestionService(List<BookmakerAdapter> adapterList,
                             DSLContext dsl,
                             EventMatcher eventMatcher,
-                            TeamMatcher teamMatcher,  // ← ДОЛЖЕН БЫТЬ
+                            TeamMatcher teamMatcher,
                             LeagueMatcher leagueMatcher,
                             SportMatcher sportMatcher,
                             ApplicationEventPublisher eventPublisher) {
@@ -73,12 +76,7 @@ public class IngestionService {
         this.eventPublisher = eventPublisher;
     }
 
-    /**
-     * Плановый запуск загрузки данных от всех активных букмекеров
-     * Интервал настраивается в application.yml (scheduler.fixed-delay-ms)
-     * По умолчанию: 5 минут (300000 мс)
-     */
-    @Scheduled(fixedDelayString = "${scheduler.fixed-delay-ms:300000}", initialDelay = 5000) // через 5 сек, затем каждые 5 мин
+    @Scheduled(fixedDelayString = "${scheduler.fixed-delay-ms:300000}", initialDelay = 5000)
     public void scheduledIngestion() {
 
         var allBookmakers = dsl.selectFrom(Tables.BOOKMAKERS).fetch();
@@ -93,7 +91,6 @@ public class IngestionService {
             log.info("  Адаптер: code='{}', class={}", key, adapters.get(key).getClass().getSimpleName());
         }
 
-
         if (!schedulerEnabled) {
             log.debug("Планировщик отключен в конфигурации");
             return;
@@ -104,7 +101,6 @@ public class IngestionService {
         log.info("╚══════════════════════════════════════════════════════════════╝");
         log.info("Интервал: {} минут", fixedDelayMs / 60000);
 
-        // Получаем список активных букмекеров
         var activeBookmakers = dsl.selectFrom(Tables.BOOKMAKERS)
                 .where(Tables.BOOKMAKERS.ENABLED.isTrue())
                 .fetch();
@@ -124,6 +120,7 @@ public class IngestionService {
                 log.info("✅ Загрузка {} завершена за {} секунд", code, duration / 1000);
             } catch (Exception e) {
                 log.error("❌ Ошибка при загрузке {}: {}", code, e.getMessage(), e);
+                logErrorLocation(e);
             }
         }
 
@@ -182,15 +179,15 @@ public class IngestionService {
 
             eventPublisher.publishEvent(new OddsUpdatedEvent(bookmakerCode, null));
 
-            // Очистка устаревших событий (используем refresh_seconds из БД, дефолт 300 секунд = 5 минут)
             Integer refreshSeconds = bookmaker.getRefreshSeconds();
             if (refreshSeconds == null || refreshSeconds <= 0) {
-                refreshSeconds = 300; // значение по умолчанию
+                refreshSeconds = 300;
             }
             cleanupOrphanedEvents(bookmaker.getId(), refreshSeconds);
 
         } catch (Exception e) {
-            log.error("{}: {}", bookmakerCode, e.getMessage());
+            log.error("{}: {}", bookmakerCode, e.getMessage(), e);
+            logErrorLocation(e);
         }
     }
 
@@ -200,418 +197,111 @@ public class IngestionService {
                 .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
                 .fetchOneInto(Long.class);
 
+        if (bookmakerId == null) {
+            log.error("Bookmaker not found: {}", bookmakerCode);
+            return false;
+        }
+
         boolean hasNewMarkets = false;
 
         for (RawMarket rawMarket : rawEvent.getMarkets()) {
-            MarketsRecord marketRecord = new MarketsRecord();
-            marketRecord.setEventId(internalEventId);
-            marketRecord.setBookmakerId(bookmakerId);
-            marketRecord.setMarketType(rawMarket.getMarketTypeName());
-            marketRecord.setPeriod(rawMarket.getPeriodName());
-            marketRecord.setLine(rawMarket.getLine());
-            marketRecord.setSourceExternalId(rawMarket.getExternalId());
-
-            // Пытаемся вставить, если конфликт - обновляем
-            int result = dsl.insertInto(Tables.MARKETS)
-                    .set(marketRecord)
-                    .onConflict(Tables.MARKETS.EVENT_ID, Tables.MARKETS.BOOKMAKER_ID,
-                            Tables.MARKETS.MARKET_TYPE, Tables.MARKETS.PERIOD, Tables.MARKETS.LINE)
-                    .doUpdate()
-                    .set(Tables.MARKETS.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
-                    .set(Tables.MARKETS.SOURCE_EXTERNAL_ID, rawMarket.getExternalId())
-                    .execute();
-
-            if (result == 1) {
-                hasNewMarkets = true;
-            }
-
-            // Получаем ID рынка - используем source_external_id для точного поиска
-            MarketsRecord savedMarket = dsl.selectFrom(Tables.MARKETS)
-                    .where(Tables.MARKETS.SOURCE_EXTERNAL_ID.eq(rawMarket.getExternalId()))
-                    .and(Tables.MARKETS.EVENT_ID.eq(internalEventId))
+            MarketsRecord existingMarket = dsl.selectFrom(Tables.MARKETS)
+                    .where(Tables.MARKETS.EVENT_ID.eq(internalEventId))
                     .and(Tables.MARKETS.BOOKMAKER_ID.eq(bookmakerId))
-                    .fetchAny();  // <-- ЗАМЕНИЛ fetchOne() НА fetchAny()
+                    .and(Tables.MARKETS.MARKET_TYPE.eq(rawMarket.getMarketTypeName()))
+                    .and(Tables.MARKETS.PERIOD.eq(rawMarket.getPeriodName()))
+                    .fetchAny();
 
-            if (savedMarket == null) {
-                // Fallback: ищем по полям
-                savedMarket = dsl.selectFrom(Tables.MARKETS)
-                        .where(Tables.MARKETS.EVENT_ID.eq(internalEventId))
-                        .and(Tables.MARKETS.BOOKMAKER_ID.eq(bookmakerId))
-                        .and(Tables.MARKETS.MARKET_TYPE.eq(rawMarket.getMarketTypeName()))
-                        .and(Tables.MARKETS.PERIOD.eq(rawMarket.getPeriodName()))
-                        .fetchAny();  // <-- ЗАМЕНИЛ fetchOne() НА fetchAny()
+            MarketsRecord marketRecord;
+
+            if (existingMarket == null) {
+                marketRecord = new MarketsRecord();
+                marketRecord.setEventId(internalEventId);
+                marketRecord.setBookmakerId(bookmakerId);
+                marketRecord.setMarketType(rawMarket.getMarketTypeName());
+                marketRecord.setPeriod(rawMarket.getPeriodName());
+                marketRecord.setLine(rawMarket.getLine());
+                marketRecord.setSourceExternalId(rawMarket.getExternalId());
+                marketRecord.setUpdatedAt(OffsetDateTime.now(ZoneOffset.UTC));
+
+                marketRecord = dsl.insertInto(Tables.MARKETS)
+                        .set(marketRecord)
+                        .returning(Tables.MARKETS.ID)
+                        .fetchOne();
+
+                if (marketRecord != null) {
+                    hasNewMarkets = true;
+                    log.debug("Created new market: {}", marketRecord.getId());
+                }
+            } else {
+                marketRecord = existingMarket;
+                dsl.update(Tables.MARKETS)
+                        .set(Tables.MARKETS.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
+                        .set(Tables.MARKETS.SOURCE_EXTERNAL_ID, rawMarket.getExternalId())
+                        .where(Tables.MARKETS.ID.eq(marketRecord.getId()))
+                        .execute();
+                log.debug("Updated existing market: {}", marketRecord.getId());
             }
 
-            if (savedMarket == null) continue;
+            if (marketRecord == null) {
+                log.warn("Failed to get market record for event: {}", internalEventId);
+                continue;
+            }
 
-            Long marketId = savedMarket.getId();
+            Long marketId = marketRecord.getId();
 
             for (RawOutcome rawOutcome : rawMarket.getOutcomes()) {
-                dsl.insertInto(Tables.OUTCOMES)
-                        .set(Tables.OUTCOMES.MARKET_ID, marketId)
-                        .set(Tables.OUTCOMES.OUTCOME_KEY, rawOutcome.getOutcomeKeyName())
-                        .set(Tables.OUTCOMES.VALUE, rawOutcome.getOutcomeValueDescription())
-                        .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
-                        .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
-                        .onConflict(Tables.OUTCOMES.MARKET_ID, Tables.OUTCOMES.OUTCOME_KEY)
-                        .doUpdate()
-                        .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
-                        .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
-                        .set(Tables.OUTCOMES.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
-                        .execute();
+                if (rawOutcome.getOdds() == null || rawOutcome.getOdds().compareTo(BigDecimal.ZERO) <= 0) {
+                    continue;
+                }
+
+                OutcomesRecord existingOutcome = dsl.selectFrom(Tables.OUTCOMES)
+                        .where(Tables.OUTCOMES.MARKET_ID.eq(marketId))
+                        .and(Tables.OUTCOMES.OUTCOME_KEY.eq(rawOutcome.getOutcomeKeyName()))
+                        .fetchAny();
+
+                if (existingOutcome == null) {
+                    dsl.insertInto(Tables.OUTCOMES)
+                            .set(Tables.OUTCOMES.MARKET_ID, marketId)
+                            .set(Tables.OUTCOMES.OUTCOME_KEY, rawOutcome.getOutcomeKeyName())
+                            .set(Tables.OUTCOMES.VALUE, rawOutcome.getOutcomeValueDescription())
+                            .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
+                            .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
+                            .set(Tables.OUTCOMES.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
+                            .execute();
+                    log.debug("Created new outcome: {} for market: {}", rawOutcome.getOutcomeKeyName(), marketId);
+                } else {
+                    dsl.update(Tables.OUTCOMES)
+                            .set(Tables.OUTCOMES.ODDS, rawOutcome.getOdds())
+                            .set(Tables.OUTCOMES.IS_ACTIVE, rawOutcome.isActive())
+                            .set(Tables.OUTCOMES.UPDATED_AT, OffsetDateTime.now(ZoneOffset.UTC))
+                            .where(Tables.OUTCOMES.ID.eq(existingOutcome.getId()))
+                            .execute();
+                    log.debug("Updated outcome: {} for market: {}", rawOutcome.getOutcomeKeyName(), marketId);
+                }
             }
         }
 
         return hasNewMarkets;
     }
 
-
-//    private Long findOrCreateInternalEvent(RawEvent rawEvent, String bookmakerCode) {
-//        // Проверяем, не слишком ли старое событие (например, старше 2 часов)
-//        LocalDateTime now = LocalDateTime.now();
-//        if (rawEvent.getStartTime().isBefore(now.minusHours(2))) {
-//            log.debug("Skipping old event: {} vs {} (start time: {})",
-//                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getStartTime());
-//            return null;
-//        }
-//
-//        Optional<EventExternalRefsRecord> existingRefOpt = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
-//                .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(
-//                        dsl.select(Tables.BOOKMAKERS.ID).from(Tables.BOOKMAKERS).where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode)).limit(1)
-//                ))
-//                .and(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID.eq(rawEvent.getExternalId()))
-//                .fetchOptional();
-//
-//        if (existingRefOpt.isPresent()) {
-//            Long eventId = existingRefOpt.get().getEventId();
-//            if (eventId != null) {
-//                log.debug("Found existing internal event ID: {} for external ID: {}", eventId, rawEvent.getExternalId());
-//                return eventId;
-//            }
-//        }
-//
-//        // Пытаемся найти существующее событие по командам и времени (в пределах 1 часа)
-//        Long sportId = 1L; // football по умолчанию
-//
-//        Long homeTeamId = findOrCreateTeam(rawEvent.getHomeTeamName(), sportId);
-//        Long awayTeamId = findOrCreateTeam(rawEvent.getAwayTeamName(), sportId);
-//
-//        if (homeTeamId == null || awayTeamId == null) {
-//            log.warn("Could not find or create teams for event: {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-//            return null;
-//        }
-//
-//        // Ищем существующее событие с теми же командами и временем в пределах 1 часа
-//        EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
-//                .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
-//                .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
-//                .and(Tables.EVENTS.START_TIME.between(
-//                        rawEvent.getStartTime().minusHours(1).atOffset(ZoneOffset.UTC),
-//                        rawEvent.getStartTime().plusHours(1).atOffset(ZoneOffset.UTC)
-//                ))
-//                .fetchOneInto(EventsRecord.class);
-//
-//        if (existingEvent != null) {
-//            log.debug("Found existing event by teams: {} vs {} (ID: {})",
-//                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), existingEvent.getId());
-//            return existingEvent.getId();
-//        }
-//
-//        // Создаём новое событие только если оно не слишком старое и не найдено существующее
-//        if (rawEvent.getStartTime().isBefore(now.minusHours(1))) {
-//            log.debug("Not creating new event for old match: {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-//            return null;
-//        }
-//
-//        // Создаём новое событие
-//        EventsRecord eventRecord = new EventsRecord();
-//        eventRecord.setHomeTeamId(homeTeamId);
-//        eventRecord.setAwayTeamId(awayTeamId);
-//        eventRecord.setStartTime(rawEvent.getStartTime().atOffset(ZoneOffset.UTC));
-//        eventRecord.setStatus("SCHEDULED");
-//        eventRecord.setEventUrl(rawEvent.getEventUrl());
-//        eventRecord.setBookmakerCode(bookmakerCode);  // <-- ВОТ ЭТА СТРОЧКА БЫЛА ОТСУТСТВОВАЛА!
-//
-//        EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
-//                .set(eventRecord)
-//                .returning(Tables.EVENTS.ID)
-//                .fetchOne();
-//
-//        if (savedEvent == null) {
-//            log.error("Failed to create new event for {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-//            return null;
-//        }
-//
-//        Long internalEventId = savedEvent.getId();
-//        log.debug("Created new event ID: {} for {} vs {} (bookmaker: {})",
-//                internalEventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), bookmakerCode);
-//
-//        // Сохраняем внешнюю ссылку
-//        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
-//                .from(Tables.BOOKMAKERS)
-//                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
-//                .limit(1)
-//                .fetchOneInto(Long.class);
-//
-//        if (bookmakerId != null) {
-//            dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
-//                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, internalEventId)
-//                    .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
-//                    .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
-//                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
-//                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
-//                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, rawEvent.getStartTime().atOffset(ZoneOffset.UTC))
-//                    .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
-//                    .doUpdate()
-//                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, internalEventId)
-//                    .execute();
-//        }
-//
-//        return internalEventId;
-//    }
-
-
-    private Long findOrCreateTeam(String teamName, Long sportId) {
-        if (teamName == null || teamName.isEmpty() || "TBD".equals(teamName)) {
-            return null;
-        }
-
-        // Ищем существующую команду
-        TeamsRecord existingTeam = dsl.selectFrom(Tables.TEAMS)
-                .where(Tables.TEAMS.CANONICAL_NAME.eq(teamName))
-                .fetchOneInto(TeamsRecord.class);
-
-        if (existingTeam != null) {
-            return existingTeam.getId();
-        }
-
-        // Создаём новую команду
-        TeamsRecord newTeam = new TeamsRecord();
-        newTeam.setCanonicalName(teamName);
-        newTeam.setSportId(sportId);
-        newTeam.setNormalizedName(teamName.toLowerCase());
-
-        TeamsRecord savedTeam = dsl.insertInto(Tables.TEAMS)
-                .set(newTeam)
-                .returning(Tables.TEAMS.ID)
-                .fetchOne();
-
-        return savedTeam != null ? savedTeam.getId() : null;
-    }
-
-    /**
-     * Возвращает статус всех букмекеров
-     */
-    public void printBookmakersStatus() {
-        var bookmakers = dsl.select(
-                        Tables.BOOKMAKERS.ID,
-                        Tables.BOOKMAKERS.CODE,
-                        Tables.BOOKMAKERS.NAME,
-                        Tables.BOOKMAKERS.ENABLED
-                )
-                .from(Tables.BOOKMAKERS)
-                .fetch();
-
-        // Собираем активных букмекеров
-        var activeBookmakers = bookmakers.stream()
-                .filter(bm -> bm.get(Tables.BOOKMAKERS.ENABLED))
-                .toList();
-
-        // Формируем строку с названиями активных букмекеров
-        String activeNames = activeBookmakers.stream()
-                .map(bm -> bm.get(Tables.BOOKMAKERS.NAME))
-                .collect(Collectors.joining(", "));
-
-        log.info("=== СТАТУС БУКМЕКЕРОВ ===");
-        log.info("📊 Найдено активных букмекеров: {} ({})", activeBookmakers.size(), activeNames);
-
-        for (var bm : bookmakers) {
-            // Цветной вывод: зелёный для enabled, красный для disabled
-            String status;
-            if (bm.get(Tables.BOOKMAKERS.ENABLED)) {
-                status = "\u001B[32m✅ АКТИВЕН\u001B[0m";   // Зелёный
-            } else {
-                status = "\u001B[31m❌ НЕ АКТИВЕН\u001B[0m"; // Красный
-            }
-
-            String registered = adapters.containsKey(bm.get(Tables.BOOKMAKERS.CODE))
-                    ? " (зарегистрирован)"
-                    : " (НЕ зарегистрирован)";
-
-            log.info("- ID: {}, Code: {}, Name: {} - {}{}",
-                    bm.get(Tables.BOOKMAKERS.ID),
-                    bm.get(Tables.BOOKMAKERS.CODE),
-                    bm.get(Tables.BOOKMAKERS.NAME),
-                    status,
-                    registered);
-        }
-        log.info("=======================");
-    }
-
-    /**
-     * Находит существующее каноническое событие по сырым данным с матчингом (включая лиги)
-     */
-    private Long findCanonicalEventId(RawEvent rawEvent, String bookmakerCode) {
-        log.info("🔍 Матчинг события: {} vs {} [{}] от {}",
-                rawEvent.getHomeTeamName(),
-                rawEvent.getAwayTeamName(),
-                rawEvent.getLeagueName(),
-                bookmakerCode);
-
-        // 1. Проверяем, есть ли уже внешняя ссылка для этого БК
-        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
-                .from(Tables.BOOKMAKERS)
-                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
-                .fetchOneInto(Long.class);
-
-        if (bookmakerId == null) return null;
-
-        // Проверяем существующую внешнюю ссылку
-        EventExternalRefsRecord existingRef = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
-                .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(bookmakerId))
-                .and(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID.eq(rawEvent.getExternalId()))
-                .fetchOne();
-
-        if (existingRef != null && existingRef.getEventId() != null) {
-            log.debug("Найдена существующая внешняя ссылка для события ID: {}", existingRef.getEventId());
-            return existingRef.getEventId();
-        }
-
-        // 2. Ищем похожие события через EventMatcherService с учётом времени (±2 часа)
-        OffsetDateTime startTimeUtc = rawEvent.getStartTime().atOffset(ZoneOffset.UTC);
-
-        List<EventsRecord> candidateEvents = dsl.selectFrom(Tables.EVENTS)
-                .where(Tables.EVENTS.START_TIME.between(
-                        startTimeUtc.minusHours(2),
-                        startTimeUtc.plusHours(2)
-                ))
-                .and(Tables.EVENTS.STATUS.eq("SCHEDULED"))
-                .fetch();
-
-        EventMatcherService matcher = new EventMatcherService();
-
-        for (EventsRecord candidate : candidateEvents) {
-            // Получаем команды кандидата
-            TeamsRecord homeTeam = dsl.selectFrom(Tables.TEAMS)
-                    .where(Tables.TEAMS.ID.eq(candidate.getHomeTeamId()))
-                    .fetchOne();
-            TeamsRecord awayTeam = dsl.selectFrom(Tables.TEAMS)
-                    .where(Tables.TEAMS.ID.eq(candidate.getAwayTeamId()))
-                    .fetchOne();
-
-            if (homeTeam == null || awayTeam == null) continue;
-
-            // Получаем лигу кандидата
-            String candidateLeague = null;
-            if (candidate.getLeagueId() != null) {
-                LeaguesRecord league = dsl.selectFrom(Tables.LEAGUES)
-                        .where(Tables.LEAGUES.ID.eq(candidate.getLeagueId()))
-                        .fetchOne();
-                if (league != null) {
-                    candidateLeague = league.getName();
-                }
-            }
-
-            // Сравниваем через матчер (с учётом лиг!)
-            if (matcher.isSameEvent(
-                    rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName(),
-                    homeTeam.getCanonicalName(), awayTeam.getCanonicalName(), candidateLeague)) {
-
-                log.info("✅ Сматчено событие: {} vs {} [{}] → существующее событие ID: {}",
-                        rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName(),
-                        candidate.getId());
-
-                // Сохраняем внешнюю ссылку
-                if (existingRef == null) {
-                    dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
-                            .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, candidate.getId())
-                            .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
-                            .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
-                            .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
-                            .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
-                            .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, startTimeUtc)
-                            .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
-                            .doUpdate()
-                            .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, candidate.getId())
-                            .execute();
-                }
-
-                return candidate.getId();
+    private void logErrorLocation(Exception e) {
+        StackTraceElement[] stackTrace = e.getStackTrace();
+        for (StackTraceElement element : stackTrace) {
+            if (element.getClassName().contains("IngestionService")) {
+                log.error("Ошибка в методе: {} строка: {}",
+                        element.getMethodName(),
+                        element.getLineNumber());
+                break;
             }
         }
-
-        log.info("🆕 Событие не найдено, создаём новое: {} vs {} [{}]",
-                rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
-        return createNewEvent(rawEvent, bookmakerCode);
-    }
-
-    /**
-     * Создаёт новое каноническое событие (с лигой)
-     */
-    private Long createNewEvent(RawEvent rawEvent, String bookmakerCode) {
-        Long sportId = 1L; // football по умолчанию
-
-        // 1. Создаём или находим команды
-        Long homeTeamId = findOrCreateTeamWithNormalization(rawEvent.getHomeTeamName(), sportId, bookmakerCode);
-        Long awayTeamId = findOrCreateTeamWithNormalization(rawEvent.getAwayTeamName(), sportId, bookmakerCode);
-
-        if (homeTeamId == null || awayTeamId == null) {
-            log.warn("Не удалось создать команды для {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
-            return null;
-        }
-
-        // 2. Создаём или находим лигу
-        Long leagueId = findOrCreateLeague(rawEvent.getLeagueName(), sportId);
-
-        // 3. Создаём событие
-        EventsRecord eventRecord = new EventsRecord();
-        eventRecord.setHomeTeamId(homeTeamId);
-        eventRecord.setAwayTeamId(awayTeamId);
-        eventRecord.setLeagueId(leagueId);
-        eventRecord.setStartTime(rawEvent.getStartTime().atOffset(ZoneOffset.UTC));
-        eventRecord.setStatus("SCHEDULED");
-        eventRecord.setEventUrl(rawEvent.getEventUrl());
-        eventRecord.setBookmakerCode(bookmakerCode);
-
-        EventsRecord savedEvent = dsl.insertInto(Tables.EVENTS)
-                .set(eventRecord)
-                .returning(Tables.EVENTS.ID)
-                .fetchOne();
-
-        if (savedEvent == null) return null;
-
-        Long eventId = savedEvent.getId();
-        log.info("✅ Создано новое событие ID: {} для {} vs {} [{}]",
-                eventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
-
-        // 4. Сохраняем внешнюю ссылку
-        Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
-                .from(Tables.BOOKMAKERS)
-                .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
-                .fetchOneInto(Long.class);
-
-        if (bookmakerId != null) {
-            dsl.insertInto(Tables.EVENT_EXTERNAL_REFS)
-                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, eventId)
-                    .set(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, bookmakerId)
-                    .set(Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID, rawEvent.getExternalId())
-                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_HOME, rawEvent.getHomeTeamName())
-                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_AWAY, rawEvent.getAwayTeamName())
-                    .set(Tables.EVENT_EXTERNAL_REFS.RAW_START_TIME, rawEvent.getStartTime().atOffset(ZoneOffset.UTC))
-                    .onConflict(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID, Tables.EVENT_EXTERNAL_REFS.EXTERNAL_ID)
-                    .doUpdate()
-                    .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, eventId)
-                    .execute();
-        }
-
-        return eventId;
     }
 
     private Long findOrCreateEvent(RawEvent rawEvent, String bookmakerCode) {
         Long sportId = 1L;
 
-        Long homeTeamId = findOrCreateTeamWithNormalization(rawEvent.getHomeTeamName(), sportId, bookmakerCode);
-        Long awayTeamId = findOrCreateTeamWithNormalization(rawEvent.getAwayTeamName(), sportId, bookmakerCode);
+        Long homeTeamId = findOrCreateTeamWithNormalization(rawEvent.getHomeTeamName(), sportId);
+        Long awayTeamId = findOrCreateTeamWithNormalization(rawEvent.getAwayTeamName(), sportId);
 
         if (homeTeamId == null || awayTeamId == null) {
             log.warn("Не удалось создать команды для {} vs {}", rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName());
@@ -621,17 +311,13 @@ public class IngestionService {
         Long leagueId = findOrCreateLeague(rawEvent.getLeagueName(), sportId);
         OffsetDateTime startTimeUtc = rawEvent.getStartTime().atOffset(ZoneOffset.UTC);
 
+        // Ищем существующее событие по ID команд
         EventsRecord existingEvent = dsl.selectFrom(Tables.EVENTS)
                 .where(Tables.EVENTS.HOME_TEAM_ID.eq(homeTeamId))
                 .and(Tables.EVENTS.AWAY_TEAM_ID.eq(awayTeamId))
-//                .and(Tables.EVENTS.START_TIME.between(
-//                        startTimeUtc.minusHours(2),
-//                        startTimeUtc.plusHours(2)
-//                ))
-                .fetchOne();
+                .fetchAny();
 
         if (existingEvent != null) {
-            // Спам-логи убраны — только обновляем ссылку без вывода
             Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
                     .from(Tables.BOOKMAKERS)
                     .where(Tables.BOOKMAKERS.CODE.eq(bookmakerCode))
@@ -650,12 +336,27 @@ public class IngestionService {
                         .set(Tables.EVENT_EXTERNAL_REFS.EVENT_ID, existingEvent.getId())
                         .execute();
             }
+
+            // ✅ ОБНОВЛЯЕМ URL, если он изменился (например, стал правильным)
+            if (rawEvent.getEventUrl() != null && !rawEvent.getEventUrl().equals(existingEvent.getEventUrl())) {
+                dsl.update(Tables.EVENTS)
+                        .set(Tables.EVENTS.EVENT_URL, rawEvent.getEventUrl())
+                        .set(Tables.EVENTS.HOME_TEAM, rawEvent.getHomeTeamName())      // ← ДОБАВИТЬ
+                        .set(Tables.EVENTS.AWAY_TEAM, rawEvent.getAwayTeamName())      // ← ДОБАВИТЬ
+                        .where(Tables.EVENTS.ID.eq(existingEvent.getId()))
+                        .execute();
+                log.info("🔄 Обновлён URL для события {}: {}", existingEvent.getId(), rawEvent.getEventUrl());
+            }
+
             return existingEvent.getId();
         }
 
+        // СОЗДАЁМ НОВОЕ СОБЫТИЕ
         EventsRecord eventRecord = new EventsRecord();
         eventRecord.setHomeTeamId(homeTeamId);
         eventRecord.setAwayTeamId(awayTeamId);
+        eventRecord.setHomeTeam(rawEvent.getHomeTeamName());      // ← ДОБАВИТЬ!
+        eventRecord.setAwayTeam(rawEvent.getAwayTeamName());      // ← ДОБАВИТЬ!
         eventRecord.setLeagueId(leagueId);
         eventRecord.setStartTime(startTimeUtc);
         eventRecord.setStatus("SCHEDULED");
@@ -670,8 +371,9 @@ public class IngestionService {
         if (savedEvent == null) return null;
 
         Long eventId = savedEvent.getId();
-        log.info("✅ Создано новое событие ID: {} для {} vs {} [{}]",
-                eventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(), rawEvent.getLeagueName());
+        log.info("✅ Создано новое событие ID: {} для {} vs {} [{}], URL: {}",
+                eventId, rawEvent.getHomeTeamName(), rawEvent.getAwayTeamName(),
+                rawEvent.getLeagueName(), rawEvent.getEventUrl());
 
         Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
                 .from(Tables.BOOKMAKERS)
@@ -695,22 +397,82 @@ public class IngestionService {
         return eventId;
     }
 
-
-    /**
-     * Находит или создаёт лигу
-     */
-    /**
-     * Находит или создаёт лигу
-     */
-    private Long findOrCreateLeague(String leagueName, Long sportId) {
-        if (leagueName == null || leagueName.isEmpty() || "Unknown League".equals(leagueName)) {
-            return null; // лига не обязательна
+    private Long findOrCreateTeam(String teamName, Long sportId) {
+        if (teamName == null || teamName.isEmpty() || "TBD".equals(teamName)) {
+            return null;
         }
 
-        // Нормализуем название лиги для поиска
+        TeamsRecord existingTeam = dsl.selectFrom(Tables.TEAMS)
+                .where(Tables.TEAMS.CANONICAL_NAME.eq(teamName))
+                .fetchOneInto(TeamsRecord.class);
+
+        if (existingTeam != null) {
+            return existingTeam.getId();
+        }
+
+        TeamsRecord newTeam = new TeamsRecord();
+        newTeam.setCanonicalName(teamName);
+        newTeam.setSportId(sportId);
+        newTeam.setNormalizedName(teamName.toLowerCase());
+
+        TeamsRecord savedTeam = dsl.insertInto(Tables.TEAMS)
+                .set(newTeam)
+                .returning(Tables.TEAMS.ID)
+                .fetchOne();
+
+        return savedTeam != null ? savedTeam.getId() : null;
+    }
+
+    public void printBookmakersStatus() {
+        var bookmakers = dsl.select(
+                        Tables.BOOKMAKERS.ID,
+                        Tables.BOOKMAKERS.CODE,
+                        Tables.BOOKMAKERS.NAME,
+                        Tables.BOOKMAKERS.ENABLED
+                )
+                .from(Tables.BOOKMAKERS)
+                .fetch();
+
+        var activeBookmakers = bookmakers.stream()
+                .filter(bm -> bm.get(Tables.BOOKMAKERS.ENABLED))
+                .toList();
+
+        String activeNames = activeBookmakers.stream()
+                .map(bm -> bm.get(Tables.BOOKMAKERS.NAME))
+                .collect(Collectors.joining(", "));
+
+        log.info("=== СТАТУС БУКМЕКЕРОВ ===");
+        log.info("📊 Найдено активных букмекеров: {} ({})", activeBookmakers.size(), activeNames);
+
+        for (var bm : bookmakers) {
+            String status;
+            if (bm.get(Tables.BOOKMAKERS.ENABLED)) {
+                status = "\u001B[32m✅ АКТИВЕН\u001B[0m";
+            } else {
+                status = "\u001B[31m❌ НЕ АКТИВЕН\u001B[0m";
+            }
+
+            String registered = adapters.containsKey(bm.get(Tables.BOOKMAKERS.CODE))
+                    ? " (зарегистрирован)"
+                    : " (НЕ зарегистрирован)";
+
+            log.info("- ID: {}, Code: {}, Name: {} - {}{}",
+                    bm.get(Tables.BOOKMAKERS.ID),
+                    bm.get(Tables.BOOKMAKERS.CODE),
+                    bm.get(Tables.BOOKMAKERS.NAME),
+                    status,
+                    registered);
+        }
+        log.info("=======================");
+    }
+
+    private Long findOrCreateLeague(String leagueName, Long sportId) {
+        if (leagueName == null || leagueName.isEmpty() || "Unknown League".equals(leagueName)) {
+            return null;
+        }
+
         String normalizedLeagueName = leagueName.trim().toLowerCase();
 
-        // Ищем существующую лигу
         LeaguesRecord existingLeague = dsl.selectFrom(Tables.LEAGUES)
                 .where(Tables.LEAGUES.NAME.likeIgnoreCase(normalizedLeagueName))
                 .and(Tables.LEAGUES.SPORT_ID.eq(sportId))
@@ -720,7 +482,6 @@ public class IngestionService {
             return existingLeague.getId();
         }
 
-        // Создаём новую лигу
         LeaguesRecord newLeague = new LeaguesRecord();
         newLeague.setName(leagueName);
         newLeague.setSportId(sportId);
@@ -734,44 +495,37 @@ public class IngestionService {
         return savedLeague.getId();
     }
 
-    /**
-     * Находит или создаёт команду с нормализацией через TeamMatcher
-     */
-    private Long findOrCreateTeamWithNormalization(String teamName, Long sportId, String bookmakerCode) {
-        if (teamName == null || teamName.isEmpty() || "TBD".equals(teamName)) {
-            return null;
+    private Long findOrCreateTeamWithNormalization(String teamName, Long sportId) {
+        if (teamName == null || teamName.isBlank()) return null;
+
+        String normalized = normalizeTeamName(teamName);
+
+        var existing = dsl.select(TEAMS.ID)
+                .from(TEAMS)
+                .where(TEAMS.NORMALIZED_NAME.eq(normalized))
+                .fetchOne();
+
+        if (existing != null) {
+            return existing.get(TEAMS.ID);
         }
 
-        // 1. Сначала ищем через алиасы (точное совпадение у конкретного БК)
-        Optional<TeamsRecord> byAlias = teamMatcher.findCanonicalTeamByAliasAndBookmaker(teamName, bookmakerCode);
-        if (byAlias.isPresent()) {
-            log.debug("Команда найдена по алиасу: {} → ID: {}", teamName, byAlias.get().getId());
-            return byAlias.get().getId();
-        }
-
-        // 2. Нормализуем имя и ищем
-        String normalized = teamMatcher.normalizeTeamName(teamName);
-        Optional<TeamsRecord> byNormalized = teamMatcher.findCanonicalTeam(normalized);
-        if (byNormalized.isPresent()) {
-            // Создаём алиас для будущих раз
-            createTeamAlias(byNormalized.get().getId(), bookmakerCode, teamName);
-            log.debug("Команда найдена по нормализации: {} → ID: {}", teamName, byNormalized.get().getId());
-            return byNormalized.get().getId();
-        }
-
-        // 3. Создаём новую команду
-        TeamsRecord newTeam = teamMatcher.createCanonicalTeam(teamName, sportId);
-
-        // Создаём алиас
-        createTeamAlias(newTeam.getId(), bookmakerCode, teamName);
-
-        log.info("Создана новая команда: {} (ID: {})", teamName, newTeam.getId());
-        return newTeam.getId();
+        return dsl.insertInto(TEAMS)
+                .set(TEAMS.SPORT_ID, sportId)
+                .set(TEAMS.CANONICAL_NAME, teamName)
+                .set(TEAMS.NORMALIZED_NAME, normalized)
+                .returning(TEAMS.ID)
+                .fetchOne()
+                .get(TEAMS.ID);
     }
 
-    /**
-     * Создаёт алиас команды для букмекера
-     */
+    private String normalizeTeamName(String name) {
+        if (name == null) return null;
+        return name.toLowerCase()
+                .trim()
+                .replaceAll("[^a-zа-яё\\s]", "")
+                .replaceAll("\\s+", " ");
+    }
+
     private void createTeamAlias(Long teamId, String bookmakerCode, String alias) {
         Long bookmakerId = dsl.select(Tables.BOOKMAKERS.ID)
                 .from(Tables.BOOKMAKERS)
@@ -789,24 +543,12 @@ public class IngestionService {
                 .execute();
     }
 
-    /**
-     * Очищает устаревшие ссылки на события для указанного букмекера
-     * @param bookmakerId ID букмекера
-     * @param refreshSeconds интервал обновления в секундах (из настроек БК)
-     */
-    /**
-     * Очищает устаревшие ссылки на события для указанного букмекера
-     * @param bookmakerId ID букмекера
-     * @param refreshSeconds интервал обновления в секундах (из настроек БК)
-     */
     private void cleanupOrphanedEvents(Long bookmakerId, int refreshSeconds) {
         log.debug("Starting cleanup of orphaned events for bookmaker ID: {}", bookmakerId);
 
-        // Порог: если событие не обновлялось дольше, чем 2 цикла парсинга
         Duration staleThreshold = Duration.ofSeconds(refreshSeconds * 2L);
         OffsetDateTime cutoffTime = OffsetDateTime.now(ZoneOffset.UTC).minus(staleThreshold);
 
-        // Находим устаревшие external_refs для этого БК
         var staleRefs = dsl.selectFrom(Tables.EVENT_EXTERNAL_REFS)
                 .where(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID.eq(bookmakerId))
                 .and(Tables.EVENT_EXTERNAL_REFS.LAST_SEEN_AT.lessThan(cutoffTime))
@@ -828,7 +570,6 @@ public class IngestionService {
                     bookmakerId, externalId, eventId, lastSeen);
 
             if (eventId == null) {
-                // Если event_id не привязан — просто удаляем ссылку
                 dsl.deleteFrom(Tables.EVENT_EXTERNAL_REFS)
                         .where(Tables.EVENT_EXTERNAL_REFS.ID.eq(staleRef.getId()))
                         .execute();
@@ -836,7 +577,6 @@ public class IngestionService {
                 continue;
             }
 
-            // Проверяем, есть ли у этого события другие активные букмекеры
             int otherBookmakersCount = dsl.fetchCount(
                     dsl.selectDistinct(Tables.EVENT_EXTERNAL_REFS.BOOKMAKER_ID)
                             .from(Tables.EVENT_EXTERNAL_REFS)
@@ -845,11 +585,9 @@ public class IngestionService {
             );
 
             if (otherBookmakersCount == 0) {
-                // Событие больше не нужно — удаляем каскадно
                 log.info("Event {} has no other bookmakers, deleting completely", eventId);
                 deleteEventCascade(eventId);
             } else {
-                // Удаляем только устаревшую ссылку этого БК
                 dsl.deleteFrom(Tables.EVENT_EXTERNAL_REFS)
                         .where(Tables.EVENT_EXTERNAL_REFS.ID.eq(staleRef.getId()))
                         .execute();
@@ -863,34 +601,47 @@ public class IngestionService {
      * @param eventId ID события
      */
     private void deleteEventCascade(Long eventId) {
-        // 1. Удаляем исходы (outcomes) через рынки (markets)
-        dsl.deleteFrom(Tables.OUTCOMES)
-                .where(Tables.OUTCOMES.MARKET_ID.in(
-                        dsl.select(Tables.MARKETS.ID)
-                                .from(Tables.MARKETS)
-                                .where(Tables.MARKETS.EVENT_ID.eq(eventId))
-                ))
-                .execute();
-
-        // 2. Удаляем рынки (markets)
-        dsl.deleteFrom(Tables.MARKETS)
+        // 1. Получаем все market_id для этого события
+        var marketIds = dsl.select(Tables.MARKETS.ID)
+                .from(Tables.MARKETS)
                 .where(Tables.MARKETS.EVENT_ID.eq(eventId))
-                .execute();
+                .fetch(Tables.MARKETS.ID);
 
-        // 3. Удаляем внешние ссылки (event_external_refs)
+        if (!marketIds.isEmpty()) {
+            // 2. Получаем все outcome_id для этих market_id
+            var outcomeIds = dsl.select(Tables.OUTCOMES.ID)
+                    .from(Tables.OUTCOMES)
+                    .where(Tables.OUTCOMES.MARKET_ID.in(marketIds))
+                    .fetch(Tables.OUTCOMES.ID);
+
+            if (!outcomeIds.isEmpty()) {
+                // 3. Удаляем ноги вилок, которые ссылаются на эти исходы
+                dsl.deleteFrom(Tables.ARB_LEGS)
+                        .where(Tables.ARB_LEGS.OUTCOME_ID.in(outcomeIds))
+                        .execute();
+
+                // 4. Удаляем сами исходы
+                dsl.deleteFrom(Tables.OUTCOMES)
+                        .where(Tables.OUTCOMES.ID.in(outcomeIds))
+                        .execute();
+            }
+
+            // 5. Удаляем рынки
+            dsl.deleteFrom(Tables.MARKETS)
+                    .where(Tables.MARKETS.ID.in(marketIds))
+                    .execute();
+        }
+
+        // 6. Удаляем внешние ссылки
         dsl.deleteFrom(Tables.EVENT_EXTERNAL_REFS)
                 .where(Tables.EVENT_EXTERNAL_REFS.EVENT_ID.eq(eventId))
                 .execute();
 
-        // 4. Помечаем событие как FINISHED (вместо удаления, чтобы сохранить историю)
+        // 7. Помечаем событие как FINISHED (вместо удаления, чтобы сохранить историю)
         dsl.update(Tables.EVENTS)
                 .set(Tables.EVENTS.STATUS, "FINISHED")
                 .where(Tables.EVENTS.ID.eq(eventId))
                 .execute();
 
         log.info("Event {} marked as FINISHED and all related data cleaned up", eventId);
-    }
-
-
-
-}
+    }}
