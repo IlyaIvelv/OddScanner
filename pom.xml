@@ -91,9 +91,16 @@
         </dependency>
 
         <dependency>
+            <groupId>com.microsoft.playwright</groupId>
+            <artifactId>playwright</artifactId>
+            <version>1.44.0</version>
+        </dependency>
+
+        <dependency>
             <groupId>com.fasterxml.jackson.core</groupId>
             <artifactId>jackson-databind</artifactId>
         </dependency>
+
 
         <!-- Utils & Logic -->
         <dependency>
@@ -107,12 +114,6 @@
             <version>${commons-text.version}</version>
         </dependency>
 
-        <!-- Playwright for Parsing -->
-        <dependency>
-            <groupId>com.microsoft.playwright</groupId>
-            <artifactId>playwright</artifactId>
-            <version>${playwright.version}</version>
-        </dependency>
 
         <!-- Jackson для JSON парсинга -->
         <dependency>
