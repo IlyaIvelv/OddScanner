@@ -1,17 +1,47 @@
 spring:
+  application:
+    name: odd-scanner
+
   datasource:
     url: jdbc:postgresql://localhost:5433/oddscanner
     username: user
     password: password
-  flyway:
+    driver-class-name: org.postgresql.Driver
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 5
+      connection-timeout: 30000
+      idle-timeout: 600000
+      max-lifetime: 1800000
+
+  # Liquibase
+  liquibase:
     enabled: true
-    locations: classpath:db/migration
+    change-log: classpath:db_changelog/db.changelog-master.sql
+    default-schema: public
+    drop-first: false
+    parameters:
+      prefix: odd
+      module: oddscanner
+
+  # jOOQ
   jooq:
     sql-dialect: POSTGRES
 
+# Парсеры
 parser:
   thread-pool-size: 5
+  bet365:
+    enabled: true
+    interval: 60000  # 60 секунд
+  fonbet:
+    enabled: true
+    interval: 60000
+  marathon:
+    enabled: true
+    interval: 60000
 
+# Actuator / Мониторинг
 management:
   endpoints:
     web:
@@ -20,3 +50,23 @@ management:
   metrics:
     tags:
       application: oddscanner
+  endpoint:
+    health:
+      show-details: always
+
+# Логирование
+logging:
+  level:
+    root: INFO
+    com.oddscanner: DEBUG
+    liquibase: INFO
+    org.jooq: INFO
+    com.zaxxer.hikari: INFO
+    org.springframework.boot: INFO
+
+# Swagger / OpenAPI (если используешь)
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html

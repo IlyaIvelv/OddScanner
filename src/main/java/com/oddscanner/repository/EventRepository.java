@@ -70,23 +70,21 @@ public class EventRepository {
         return dsl.insertInto(Tables.EVENTS)
                 .set(Tables.EVENTS.BOOKMAKER_ID, bookmakerId)
                 .set(Tables.EVENTS.EXTERNAL_ID, event.externalId())
-                .set(Tables.EVENTS.SPORT_NAME, event.sportName())
-                .set(Tables.EVENTS.LEAGUE_NAME, event.leagueName())
-                .set(Tables.EVENTS.TEAM1, event.team1())
-                .set(Tables.EVENTS.TEAM2, event.team2())
-                .set(Tables.EVENTS.STARTS_AT, event.startsAt())
+                .set(Tables.EVENTS.LEAGUE, event.leagueName())
+                .set(Tables.EVENTS.HOME_TEAM, event.team1())
+                .set(Tables.EVENTS.AWAY_TEAM, event.team2())
+                .set(Tables.EVENTS.START_TIME, event.startsAt())
+                .set(Tables.EVENTS.STATUS, "SCHEDULED")
                 .set(Tables.EVENTS.EVENT_URL, event.eventUrl())
-                .set(Tables.EVENTS.IS_ACTIVE, true)
                 .set(Tables.EVENTS.UPDATED_AT, LocalDateTime.now())
                 .onConflict(Tables.EVENTS.BOOKMAKER_ID, Tables.EVENTS.EXTERNAL_ID)
                 .doUpdate()
-                .set(Tables.EVENTS.SPORT_NAME, event.sportName())
-                .set(Tables.EVENTS.LEAGUE_NAME, event.leagueName())
-                .set(Tables.EVENTS.TEAM1, event.team1())
-                .set(Tables.EVENTS.TEAM2, event.team2())
-                .set(Tables.EVENTS.STARTS_AT, event.startsAt())
+                .set(Tables.EVENTS.LEAGUE, event.leagueName())
+                .set(Tables.EVENTS.HOME_TEAM, event.team1())
+                .set(Tables.EVENTS.AWAY_TEAM, event.team2())
+                .set(Tables.EVENTS.START_TIME, event.startsAt())
+                .set(Tables.EVENTS.STATUS, "SCHEDULED")
                 .set(Tables.EVENTS.EVENT_URL, event.eventUrl())
-                .set(Tables.EVENTS.IS_ACTIVE, true)
                 .set(Tables.EVENTS.UPDATED_AT, LocalDateTime.now())
                 .returning(Tables.EVENTS.ID)
                 .fetchOne()
@@ -96,26 +94,41 @@ public class EventRepository {
     public void markInactiveEvents(String bookmakerCode, Set<String> activeExternalIds) {
         Long bookmakerId = getBookmakerId(bookmakerCode);
 
+
         dsl.update(Tables.EVENTS)
-                .set(Tables.EVENTS.IS_ACTIVE, false)
+                .set(Tables.EVENTS.STATUS, "INACTIVE")
                 .set(Tables.EVENTS.UPDATED_AT, LocalDateTime.now())
                 .where(Tables.EVENTS.BOOKMAKER_ID.eq(bookmakerId))
                 .and(Tables.EVENTS.EXTERNAL_ID.notIn(activeExternalIds))
-                .and(Tables.EVENTS.IS_ACTIVE.eq(true))
+                .and(Tables.EVENTS.STATUS.ne("INACTIVE"))
                 .execute();
     }
 
     private Long saveMarket(Long eventId, RawEvent.RawMarket market) {
-        return dsl.insertInto(Tables.MARKETS)
-                .set(Tables.MARKETS.EVENT_ID, eventId)
-                .set(Tables.MARKETS.MARKET_TYPE, market.marketType())
-                .set(Tables.MARKETS.MARKET_NAME, market.marketType())
-                .onConflict(Tables.MARKETS.EVENT_ID, Tables.MARKETS.MARKET_TYPE)
-                .doUpdate()
-                .set(Tables.MARKETS.MARKET_NAME, market.marketType())
-                .returning(Tables.MARKETS.ID)
-                .fetchOne()
-                .getId();
+        // Сначала проверяем, существует ли рынок
+        Long existingId = dsl.select(Tables.MARKETS.ID)
+                .from(Tables.MARKETS)
+                .where(Tables.MARKETS.EVENT_ID.eq(eventId))
+                .and(Tables.MARKETS.MARKET_TYPE.eq(market.marketType()))
+                .fetchOne(Tables.MARKETS.ID);
+
+        if (existingId != null) {
+            // Обновляем существующий
+            dsl.update(Tables.MARKETS)
+                    .set(Tables.MARKETS.MARKET_NAME, market.marketType())
+                    .where(Tables.MARKETS.ID.eq(existingId))
+                    .execute();
+            return existingId;
+        } else {
+            // Вставляем новый
+            return dsl.insertInto(Tables.MARKETS)
+                    .set(Tables.MARKETS.EVENT_ID, eventId)
+                    .set(Tables.MARKETS.MARKET_TYPE, market.marketType())
+                    .set(Tables.MARKETS.MARKET_NAME, market.marketType())
+                    .returning(Tables.MARKETS.ID)
+                    .fetchOne()
+                    .getId();
+        }
     }
 
     private void saveOutcomes(Long marketId, List<RawEvent.RawOutcome> outcomes) {
