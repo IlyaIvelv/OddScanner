@@ -1,13 +1,11 @@
 package com.oddscanner.repository;
 
 import com.oddscanner.generated.Tables;
-import com.oddscanner.generated.tables.records.BookmakersRecord;
-import com.oddscanner.generated.tables.records.EventsRecord;
-import com.oddscanner.generated.tables.records.MarketsRecord;
 import com.oddscanner.generated.tables.records.OutcomesRecord;
 import com.oddscanner.parser.RawEvent;
 import org.jooq.DSLContext;
-import org.jooq.impl.DSL;
+import org.jooq.InsertValuesStep8;
+import org.jooq.InsertValuesStep5;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Repository;
@@ -16,12 +14,14 @@ import org.springframework.transaction.annotation.Transactional;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 @Repository
 public class EventRepository {
     private static final Logger log = LoggerFactory.getLogger(EventRepository.class);
     private final DSLContext dsl;
+    private static final int BATCH_SIZE = 500;
 
     public EventRepository(DSLContext dsl) {
         this.dsl = dsl;
@@ -41,22 +41,89 @@ public class EventRepository {
         }
 
         int savedCount = 0;
-        for (RawEvent event : events) {
-            try {
-                Long eventId = saveEvent(bookmakerId, event);
-                savedCount++;
+        for (int i = 0; i < events.size(); i += BATCH_SIZE) {
+            List<RawEvent> batch = events.subList(i, Math.min(i + BATCH_SIZE, events.size()));
+            savedCount += saveEventsBatch(bookmakerId, batch);
+        }
 
+        log.info("[EventRepository] Успешно сохранено {} событий из {}", savedCount, events.size());
+    }
+
+    private int saveEventsBatch(Long bookmakerId, List<RawEvent> events) {
+        upsertEventsBatch(bookmakerId, events);
+        Map<String, Long> eventIds = fetchEventIds(bookmakerId, events);
+
+        int savedCount = 0;
+        for (RawEvent event : events) {
+            Long eventId = eventIds.get(event.externalId());
+            if (eventId == null) {
+                log.error("[EventRepository] Не найден ID для события {}", event.externalId());
+                continue;
+            }
+
+            try {
                 for (RawEvent.RawMarket market : event.markets()) {
                     Long marketId = saveMarket(eventId, market);
                     saveOutcomes(marketId, market.outcomes());
                 }
+                savedCount++;
             } catch (Exception e) {
                 log.error("[EventRepository] Ошибка сохранения события {}: {}",
                         event.externalId(), e.getMessage(), e);
             }
         }
+        return savedCount;
+    }
 
-        log.info("[EventRepository] Успешно сохранено {} событий из {}", savedCount, events.size());
+    private void upsertEventsBatch(Long bookmakerId, List<RawEvent> events) {
+        InsertValuesStep8 insertStep = dsl.insertInto(
+                Tables.EVENTS,
+                Tables.EVENTS.BOOKMAKER_ID,
+                Tables.EVENTS.EXTERNAL_ID,
+                Tables.EVENTS.LEAGUE,
+                Tables.EVENTS.HOME_TEAM,
+                Tables.EVENTS.AWAY_TEAM,
+                Tables.EVENTS.START_TIME,
+                Tables.EVENTS.STATUS,
+                Tables.EVENTS.EVENT_URL
+        );
+
+        for (RawEvent event : events) {
+            insertStep = insertStep.values(
+                    bookmakerId,
+                    event.externalId(),
+                    event.leagueName(),
+                    event.team1(),
+                    event.team2(),
+                    event.startsAt(),
+                    "SCHEDULED",
+                    event.eventUrl()
+            );
+        }
+
+        insertStep
+                .onConflict(Tables.EVENTS.BOOKMAKER_ID, Tables.EVENTS.EXTERNAL_ID)
+                .doUpdate()
+                .set(Tables.EVENTS.LEAGUE, org.jooq.impl.DSL.excluded(Tables.EVENTS.LEAGUE))
+                .set(Tables.EVENTS.HOME_TEAM, org.jooq.impl.DSL.excluded(Tables.EVENTS.HOME_TEAM))
+                .set(Tables.EVENTS.AWAY_TEAM, org.jooq.impl.DSL.excluded(Tables.EVENTS.AWAY_TEAM))
+                .set(Tables.EVENTS.START_TIME, org.jooq.impl.DSL.excluded(Tables.EVENTS.START_TIME))
+                .set(Tables.EVENTS.STATUS, "SCHEDULED")
+                .set(Tables.EVENTS.EVENT_URL, org.jooq.impl.DSL.excluded(Tables.EVENTS.EVENT_URL))
+                .set(Tables.EVENTS.UPDATED_AT, LocalDateTime.now())
+                .execute();
+    }
+
+    private Map<String, Long> fetchEventIds(Long bookmakerId, List<RawEvent> events) {
+        List<String> externalIds = events.stream()
+                .map(RawEvent::externalId)
+                .toList();
+
+        return dsl.select(Tables.EVENTS.EXTERNAL_ID, Tables.EVENTS.ID)
+                .from(Tables.EVENTS)
+                .where(Tables.EVENTS.BOOKMAKER_ID.eq(bookmakerId))
+                .and(Tables.EVENTS.EXTERNAL_ID.in(externalIds))
+                .fetchMap(Tables.EVENTS.EXTERNAL_ID, Tables.EVENTS.ID);
     }
 
     private Long getBookmakerId(String code) {
@@ -66,34 +133,8 @@ public class EventRepository {
                 .fetchOne(Tables.BOOKMAKERS.ID);
     }
 
-    private Long saveEvent(Long bookmakerId, RawEvent event) {
-        return dsl.insertInto(Tables.EVENTS)
-                .set(Tables.EVENTS.BOOKMAKER_ID, bookmakerId)
-                .set(Tables.EVENTS.EXTERNAL_ID, event.externalId())
-                .set(Tables.EVENTS.LEAGUE, event.leagueName())
-                .set(Tables.EVENTS.HOME_TEAM, event.team1())
-                .set(Tables.EVENTS.AWAY_TEAM, event.team2())
-                .set(Tables.EVENTS.START_TIME, event.startsAt())
-                .set(Tables.EVENTS.STATUS, "SCHEDULED")
-                .set(Tables.EVENTS.EVENT_URL, event.eventUrl())
-                .set(Tables.EVENTS.UPDATED_AT, LocalDateTime.now())
-                .onConflict(Tables.EVENTS.BOOKMAKER_ID, Tables.EVENTS.EXTERNAL_ID)
-                .doUpdate()
-                .set(Tables.EVENTS.LEAGUE, event.leagueName())
-                .set(Tables.EVENTS.HOME_TEAM, event.team1())
-                .set(Tables.EVENTS.AWAY_TEAM, event.team2())
-                .set(Tables.EVENTS.START_TIME, event.startsAt())
-                .set(Tables.EVENTS.STATUS, "SCHEDULED")
-                .set(Tables.EVENTS.EVENT_URL, event.eventUrl())
-                .set(Tables.EVENTS.UPDATED_AT, LocalDateTime.now())
-                .returning(Tables.EVENTS.ID)
-                .fetchOne()
-                .getId();
-    }
-
     public void markInactiveEvents(String bookmakerCode, Set<String> activeExternalIds) {
         Long bookmakerId = getBookmakerId(bookmakerCode);
-
 
         dsl.update(Tables.EVENTS)
                 .set(Tables.EVENTS.STATUS, "INACTIVE")
@@ -105,39 +146,28 @@ public class EventRepository {
     }
 
     private Long saveMarket(Long eventId, RawEvent.RawMarket market) {
-        // Сначала проверяем, существует ли рынок
-        Long existingId = dsl.select(Tables.MARKETS.ID)
-                .from(Tables.MARKETS)
-                .where(Tables.MARKETS.EVENT_ID.eq(eventId))
-                .and(Tables.MARKETS.MARKET_TYPE.eq(market.marketType()))
-                .fetchOne(Tables.MARKETS.ID);
+        var insertStep = dsl.insertInto(
+                Tables.MARKETS,
+                Tables.MARKETS.EVENT_ID,
+                Tables.MARKETS.MARKET_TYPE,
+                Tables.MARKETS.MARKET_NAME
+        );
 
-        if (existingId != null) {
-            // Обновляем существующий
-            dsl.update(Tables.MARKETS)
-                    .set(Tables.MARKETS.MARKET_NAME, market.marketType())
-                    .where(Tables.MARKETS.ID.eq(existingId))
-                    .execute();
-            return existingId;
-        } else {
-            // Вставляем новый
-            return dsl.insertInto(Tables.MARKETS)
-                    .set(Tables.MARKETS.EVENT_ID, eventId)
-                    .set(Tables.MARKETS.MARKET_TYPE, market.marketType())
-                    .set(Tables.MARKETS.MARKET_NAME, market.marketType())
-                    .returning(Tables.MARKETS.ID)
-                    .fetchOne()
-                    .getId();
-        }
+        return insertStep
+                .values(eventId, market.marketType(), market.marketType())
+                .onConflict(Tables.MARKETS.EVENT_ID, Tables.MARKETS.MARKET_TYPE)
+                .doUpdate()
+                .set(Tables.MARKETS.MARKET_NAME, org.jooq.impl.DSL.excluded(Tables.MARKETS.MARKET_NAME))
+                .returning(Tables.MARKETS.ID)
+                .fetchOne()
+                .get(Tables.MARKETS.ID);
     }
 
     private void saveOutcomes(Long marketId, List<RawEvent.RawOutcome> outcomes) {
-        // Удаляем старые исходы для этого рынка
         dsl.deleteFrom(Tables.OUTCOMES)
                 .where(Tables.OUTCOMES.MARKET_ID.eq(marketId))
                 .execute();
 
-        // Вставляем новые
         List<OutcomesRecord> records = new ArrayList<>();
         for (RawEvent.RawOutcome outcome : outcomes) {
             var record = new OutcomesRecord();
