@@ -54,7 +54,7 @@ public class FonbetParser extends AbstractBookmakerParser {
     }
 
     public FonbetParser(MeterRegistry meterRegistry, Browser browser, EventRepository eventRepository) {
-        super(meterRegistry);
+        super(meterRegistry, eventRepository);
         this.browser = browser;
         this.eventRepository = eventRepository;
     }

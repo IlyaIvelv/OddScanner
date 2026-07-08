@@ -16,7 +16,7 @@ public class Bet365Parser extends AbstractBookmakerParser {
     private final EventRepository eventRepository;
 
     public Bet365Parser(MeterRegistry meterRegistry, EventRepository eventRepository) {
-        super(meterRegistry);
+        super(meterRegistry, eventRepository);
         this.eventRepository = eventRepository;
     }
 
@@ -32,26 +32,26 @@ public class Bet365Parser extends AbstractBookmakerParser {
         // TODO: Реальная логика парсинга Bet365
         // Для MVP создадим тестовые данные
 
-        RawEvent testEvent = new RawEvent(
-                "BET365_TEST_" + System.currentTimeMillis(),
-                "Теннис",
-                "ATP",
-                "Надаль",
-                "Джокович",
-                LocalDateTime.now().plusHours(1),
-                List.of(
-                        new RawEvent.RawMarket("Winner", List.of(
-                                new RawEvent.RawOutcome("Надаль", new BigDecimal("2.50")),
-                                new RawEvent.RawOutcome("Джокович", new BigDecimal("1.55"))
-                        ))
-                ),
-                ""
-        );
-
-        events.add(testEvent);
-        eventRepository.saveEvents("BET365", events);
-
-        log.info("[Bet365] Сохранено {} событий", events.size());
+//        RawEvent testEvent = new RawEvent(
+//                "BET365_TEST_" + System.currentTimeMillis(),
+//                "Теннис",
+//                "ATP",
+//                "Надаль",
+//                "Джокович",
+//                LocalDateTime.now().plusHours(1),
+//                List.of(
+//                        new RawEvent.RawMarket("Winner", List.of(
+//                                new RawEvent.RawOutcome("Надаль", new BigDecimal("2.50")),
+//                                new RawEvent.RawOutcome("Джокович", new BigDecimal("1.55"))
+//                        ))
+//                ),
+//                ""
+//        );
+//
+//        events.add(testEvent);
+//        eventRepository.saveEvents("BET365", events);
+//
+//        log.info("[Bet365] Сохранено {} событий", events.size());
         return events;
     }
 }

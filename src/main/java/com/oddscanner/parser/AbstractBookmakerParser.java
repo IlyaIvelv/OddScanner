@@ -1,5 +1,6 @@
 package com.oddscanner.parser;
 
+import com.oddscanner.repository.EventRepository;
 import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Timer;
 import org.slf4j.Logger;
@@ -8,15 +9,24 @@ import org.springframework.scheduling.annotation.Scheduled;
 
 public abstract class AbstractBookmakerParser implements BookmakerParser {
     private final MeterRegistry meterRegistry;
+    protected final EventRepository eventRepository;
     protected final Logger log = LoggerFactory.getLogger(getClass());
 
-    protected AbstractBookmakerParser(MeterRegistry meterRegistry) {
+    protected AbstractBookmakerParser(MeterRegistry meterRegistry, EventRepository eventRepository) {
         this.meterRegistry = meterRegistry;
+        this.eventRepository = eventRepository;
     }
 
-    @Scheduled(fixedDelay = 60_000) // Запуск каждые 60 секунд
+    @Scheduled(fixedDelay = 60_000)
     public final void scheduledRun() {
         String name = getName();
+
+        // Проверяем, активен ли букмекер в БД
+        if (!eventRepository.isBookmakerActive(name)) {
+            log.debug("[{}] Парсер неактивен, пропускаю", name);
+            return;
+        }
+
         Timer.Sample sample = Timer.start(meterRegistry);
         String status = "success";
 
@@ -41,4 +51,5 @@ public abstract class AbstractBookmakerParser implements BookmakerParser {
                     .increment();
         }
     }
+
 }

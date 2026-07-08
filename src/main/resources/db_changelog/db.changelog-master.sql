@@ -148,7 +148,8 @@ CREATE INDEX idx_arbitrages_active ON arbitrages(is_active, created_at DESC);
 INSERT INTO bookmakers (code, name, api_base_url) VALUES
     ('FONBET', 'Фонбет', 'https://api.fonbet.ru'),
     ('BET365', 'Bet365', 'https://api.bet365.com'),
-    ('MARATHON', 'Марафон', 'https://api.marathonbet.com')
+    ('MARATHON', 'Марафон', 'https://api.marathonbet.com'),
+    ('POLYMARKET', 'Polymarket', 'https://gamma-api.polymarket.com')
 ON CONFLICT (code) DO NOTHING;
 
 --rollback DELETE FROM bookmakers WHERE code IN ('FONBET', 'BET365', 'MARATHON');

@@ -129,7 +129,7 @@ public class EventRepository {
     private Long getBookmakerId(String code) {
         return dsl.select(Tables.BOOKMAKERS.ID)
                 .from(Tables.BOOKMAKERS)
-                .where(Tables.BOOKMAKERS.CODE.eq(code))
+                .where(org.jooq.impl.DSL.upper(Tables.BOOKMAKERS.CODE).eq(code.toUpperCase()))
                 .fetchOne(Tables.BOOKMAKERS.ID);
     }
 
@@ -182,4 +182,17 @@ public class EventRepository {
             dsl.batchInsert(records).execute();
         }
     }
+
+    public boolean isBookmakerActive(String code) {
+        log.info("[EventRepository] Проверяю активность для code='{}'", code);
+
+        Boolean isActive = dsl.select(Tables.BOOKMAKERS.IS_ACTIVE)
+                .from(Tables.BOOKMAKERS)
+                .where(org.jooq.impl.DSL.upper(Tables.BOOKMAKERS.CODE).eq(code.toUpperCase()))
+                .fetchOne(Tables.BOOKMAKERS.IS_ACTIVE);
+
+        log.info("[EventRepository] Результат для '{}': isActive={}", code, isActive);
+        return isActive != null && isActive;
+    }
+
 }
