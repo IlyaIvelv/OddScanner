@@ -18,7 +18,11 @@ import java.net.http.HttpResponse;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Set;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @Component
@@ -28,19 +32,15 @@ public class PolymarketParser extends AbstractBookmakerParser {
     private final HttpClient httpClient;
     private final ObjectMapper objectMapper;
 
-    // HARDCODED список событий ЧМ-2026 из твоих JSON
-    private static final Map<String, String> WORLD_CUP_EVENTS = new LinkedHashMap<>();
-    static {
-        // Основные матчи
-        WORLD_CUP_EVENTS.put("643884", "Switzerland vs. Algeria");
-        WORLD_CUP_EVENTS.put("643876", "Spain vs. Austria");
-        // More Markets
-        WORLD_CUP_EVENTS.put("643975", "Switzerland vs. Algeria - More Markets");
-        WORLD_CUP_EVENTS.put("643977", "Spain vs. Austria - More Markets");
+    // Паттерн для полных названий команд: "France vs. Spain", "Argentina vs Switzerland"
+    private static final Pattern FULL_TEAMS_PATTERN = Pattern.compile(
+            "([A-Z][a-zA-Z\\s\\-']+?)\\s+vs\\.?\\s+([A-Z][a-zA-Z\\s\\-']+?)(?:\\s+-|\\s*$|\\s+\\?)"
+    );
 
-        // TODO: Добавь сюда все ID событий, которые найдешь на сайте!
-        // WORLD_CUP_EVENTS.put("ID", "Название матча");
-    }
+    // Паттерн для сокращений: "FRA vs ENG"
+    private static final Pattern SHORT_TEAMS_PATTERN = Pattern.compile(
+            "([A-Z]{2,3})\\s+vs\\.?\\s+([A-Z]{2,3})"
+    );
 
     public PolymarketParser(MeterRegistry meterRegistry, EventRepository eventRepository) {
         super(meterRegistry, eventRepository);
@@ -57,39 +57,79 @@ public class PolymarketParser extends AbstractBookmakerParser {
     public List<RawEvent> doParse() throws Exception {
         List<RawEvent> allEvents = new ArrayList<>();
 
-        log.info("[Polymarket] Начинаю парсинг ЧМ-2026...");
-        log.info("[Polymarket] Загружено {} hardcoded событий", WORLD_CUP_EVENTS.size());
+        log.info("[Polymarket] Начинаю парсинг...");
 
-        // Используем ТОЛЬКО hardcoded список
-        for (Map.Entry<String, String> entry : WORLD_CUP_EVENTS.entrySet()) {
-            String eventId = entry.getKey();
-            String title = entry.getValue();
+        JsonNode eventsArray = fetchEventsList();
+        if (eventsArray == null || !eventsArray.isArray()) {
+            log.warn("[Polymarket] Не удалось получить список событий");
+            return allEvents;
+        }
 
+        log.info("[Polymarket] Найдено {} событий в API", eventsArray.size());
+
+        LocalDateTime now = LocalDateTime.now();
+        LocalDateTime minTime = now.plusHours(1);
+        LocalDateTime maxTime = now.plusDays(14);  // Увеличили до 14 дней
+
+        int processedCount = 0;
+        int skippedCount = 0;
+
+        for (JsonNode eventNode : eventsArray) {
             try {
-                log.info("[Polymarket] Парсинг события: {} (ID: {})", title, eventId);
+                String eventId = eventNode.path("id").asText();
+                String title = eventNode.path("title").asText();
+                boolean closed = eventNode.path("closed").asBoolean(false);
+                boolean active = eventNode.path("active").asBoolean(false);
 
-                JsonNode eventNode = fetchEventDetails(eventId);
-                if (eventNode == null) {
-                    log.warn("[Polymarket] Не удалось получить событие {}", eventId);
+                if (closed || !active) {
+                    skippedCount++;
                     continue;
                 }
 
-                RawEvent event = parseEventWithMarkets(eventNode);
-                if (event != null && !event.markets().isEmpty()) {
-                    allEvents.add(event);
-                    log.info("[Polymarket] ✅ Добавлено событие: {} ({} рынков)", title, event.markets().size());
-                } else {
-                    log.warn("[Polymarket] ❌ Не удалось распарсить событие: {}", title);
+                if (!isSportsEvent(eventNode)) {
+                    skippedCount++;
+                    continue;
                 }
 
-                Thread.sleep(500); // пауза чтобы не забанили
+                LocalDateTime startTime = parseStartDate(eventNode);
+                if (startTime.isBefore(minTime) || startTime.isAfter(maxTime)) {
+                    skippedCount++;
+                    continue;
+                }
+
+                // Извлекаем команды из title
+                String[] teams = extractTeams(title);
+                if (teams == null) {
+                    skippedCount++;
+                    log.debug("[Polymarket] Не удалось извлечь команды из: {}", title);
+                    continue;
+                }
+
+                JsonNode details = fetchEventDetails(eventId);
+                if (details == null) {
+                    skippedCount++;
+                    continue;
+                }
+
+                List<RawEvent> events = parseRealMatch(details, teams);
+
+                if (!events.isEmpty()) {
+                    allEvents.addAll(events);
+                    processedCount++;
+                    log.info("[Polymarket] ✅ Матч: {} vs {} ({} рынков)",
+                            teams[0], teams[1], events.get(0).markets().size());
+                } else {
+                    skippedCount++;
+                }
+
+                Thread.sleep(300);
 
             } catch (Exception e) {
-                log.error("[Polymarket] Ошибка парсинга события {}: {}", title, e.getMessage());
+                log.error("[Polymarket] Ошибка парсинга: {}", e.getMessage());
             }
         }
 
-        log.info("[Polymarket] Итого найдено спортивных событий: {}", allEvents.size());
+        log.info("[Polymarket] Спарсено {} событий, {} пропущено", allEvents.size(), skippedCount);
 
         if (!allEvents.isEmpty()) {
             eventRepository.saveEvents("Polymarket", allEvents);
@@ -97,17 +137,237 @@ public class PolymarketParser extends AbstractBookmakerParser {
                     .map(RawEvent::externalId)
                     .collect(Collectors.toSet());
             eventRepository.markInactiveEvents("Polymarket", activeExternalIds);
-            log.info("[Polymarket] Сохранено {} спортивных событий", allEvents.size());
+            log.info("[Polymarket] Сохранено {} событий", allEvents.size());
         } else {
-            log.warn("[Polymarket] Не найдено спортивных событий");
+            log.warn("[Polymarket] Не найдено подходящих событий");
         }
 
         return allEvents;
     }
 
     /**
-     * Получает детальную информацию о событии
+     * Извлекает команды из title (полные названия или сокращения)
      */
+    private String[] extractTeams(String text) {
+        if (text == null) return null;
+
+        // Сначала ищем полные названия: "France vs. Spain"
+        Matcher matcher = FULL_TEAMS_PATTERN.matcher(text);
+        if (matcher.find()) {
+            String team1 = matcher.group(1).trim();
+            String team2 = matcher.group(2).trim();
+
+            // Убираем лишние слова из team2
+            team2 = team2.replaceAll("\\s+-.*$", "").trim();
+
+            if (!team1.isEmpty() && !team2.isEmpty()) {
+                return new String[]{team1, team2};
+            }
+        }
+
+        // Потом ищем сокращения: "FRA vs ENG"
+        matcher = SHORT_TEAMS_PATTERN.matcher(text);
+        if (matcher.find()) {
+            return new String[]{matcher.group(1), matcher.group(2)};
+        }
+
+        return null;
+    }
+
+    /**
+     * Парсит реальный матч
+     */
+    private List<RawEvent> parseRealMatch(JsonNode eventNode, String[] teams) {
+        List<RawEvent> events = new ArrayList<>();
+
+        String eventId = eventNode.path("id").asText();
+        String slug = eventNode.path("slug").asText();
+        LocalDateTime startTime = parseStartDate(eventNode);
+
+        JsonNode marketsNode = eventNode.path("markets");
+        if (!marketsNode.isArray() || marketsNode.isEmpty()) {
+            return events;
+        }
+
+        List<RawEvent.RawMarket> markets = new ArrayList<>();
+
+        for (JsonNode marketNode : marketsNode) {
+            try {
+                if (!marketNode.path("active").asBoolean(false) ||
+                        marketNode.path("closed").asBoolean(false)) {
+                    continue;
+                }
+
+                String question = marketNode.path("question").asText();
+                List<String> outcomes = parseJsonArray(marketNode.path("outcomes"));
+                List<String> prices = findPrices(marketNode);
+
+                if (outcomes.size() != prices.size() || outcomes.isEmpty()) {
+                    continue;
+                }
+
+                RawEvent.RawMarket market = parseMarket(question, outcomes, prices);
+                if (market != null) {
+                    markets.add(market);
+                }
+
+            } catch (Exception e) {
+                log.debug("[Polymarket] Ошибка парсинга рынка: {}", e.getMessage());
+            }
+        }
+
+        if (!markets.isEmpty()) {
+            String url = "https://polymarket.com/event/" + slug;
+
+            RawEvent event = new RawEvent(
+                    eventId,
+                    "Football",
+                    "World Cup",
+                    teams[0],
+                    teams[1],
+                    startTime,
+                    markets,
+                    url
+            );
+
+            events.add(event);
+        }
+
+        return events;
+    }
+
+    /**
+     * Парсит рынок (1X2 или Yes/No)
+     */
+    private RawEvent.RawMarket parseMarket(String question, List<String> outcomes, List<String> prices) {
+        String q = question.toLowerCase();
+
+        // Рынок 1X2: Home/Draw/Away
+        if (outcomes.size() == 3) {
+            int drawIndex = -1;
+            for (int i = 0; i < outcomes.size(); i++) {
+                String o = outcomes.get(i).toLowerCase();
+                if (o.equals("draw") || o.equals("ничья") || o.equals("tie")) {
+                    drawIndex = i;
+                    break;
+                }
+            }
+
+            if (drawIndex != -1) {
+                List<RawEvent.RawOutcome> marketOutcomes = new ArrayList<>();
+                for (int i = 0; i < outcomes.size(); i++) {
+                    double price = Double.parseDouble(prices.get(i));
+                    if (price > 0.001 && price < 0.999) {
+                        BigDecimal odds = convertPrice(price);
+                        marketOutcomes.add(new RawEvent.RawOutcome(outcomes.get(i), odds));
+                    }
+                }
+
+                if (marketOutcomes.size() == 3) {
+                    return new RawEvent.RawMarket("1X2", marketOutcomes);
+                }
+            }
+        }
+
+        // Рынок Yes/No или Home/Away
+        if (outcomes.size() == 2) {
+            String o1 = outcomes.get(0).toLowerCase();
+            String o2 = outcomes.get(1).toLowerCase();
+
+            if ((o1.equals("yes") && o2.equals("no")) ||
+                    (o1.equals("no") && o2.equals("yes"))) {
+
+                double price1 = Double.parseDouble(prices.get(0));
+                double price2 = Double.parseDouble(prices.get(1));
+
+                if (price1 > 0.001 && price1 < 0.999 && price2 > 0.001 && price2 < 0.999) {
+                    List<RawEvent.RawOutcome> marketOutcomes = new ArrayList<>();
+                    marketOutcomes.add(new RawEvent.RawOutcome(outcomes.get(0), convertPrice(price1)));
+                    marketOutcomes.add(new RawEvent.RawOutcome(outcomes.get(1), convertPrice(price2)));
+
+                    String marketType = "MatchWinner";
+                    if (q.contains("over") || q.contains("under")) {
+                        marketType = "Total";
+                    } else if (q.contains("both teams")) {
+                        marketType = "BothTeamsToScore";
+                    }
+
+                    return new RawEvent.RawMarket(marketType, marketOutcomes);
+                }
+            }
+        }
+
+        return null;
+    }
+
+    private boolean isSportsEvent(JsonNode eventNode) {
+        JsonNode tagsNode = eventNode.path("tags");
+        if (tagsNode.isArray()) {
+            for (JsonNode tag : tagsNode) {
+                String slug = tag.path("slug").asText();
+                if (slug.equals("sports") || slug.equals("soccer") ||
+                        slug.equals("football") || slug.equals("fifa-world-cup") ||
+                        slug.equals("world-cup")) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private JsonNode fetchEventsList() throws Exception {
+        String[] urls = {
+                API_BASE_URL + "/events/keyset?limit=100&tag_slug=fifa-world-cup&closed=false&order=startDate&ascending=true",
+                API_BASE_URL + "/events/keyset?limit=100&tag_slug=world-cup&closed=false&order=startDate&ascending=true",
+                API_BASE_URL + "/events/keyset?limit=100&tag_slug=soccer&closed=false&order=startDate&ascending=true",
+                API_BASE_URL + "/events/keyset?limit=100&tag_slug=football&closed=false&order=startDate&ascending=true"
+        };
+
+        for (String url : urls) {
+            try {
+                log.info("[Polymarket] Пробую endpoint: {}", url);
+
+                HttpRequest request = HttpRequest.newBuilder()
+                        .uri(URI.create(url))
+                        .header("Accept", "application/json")
+                        .GET()
+                        .build();
+
+                HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+
+                log.info("[Polymarket] Status: {}, Response length: {}",
+                        response.statusCode(), response.body().length());
+
+                if (response.statusCode() == 200) {
+                    JsonNode json = objectMapper.readTree(response.body());
+
+                    JsonNode eventsArray = null;
+
+                    if (json.isArray()) {
+                        eventsArray = json;
+                    } else if (json.isObject()) {
+                        if (json.has("events") && json.path("events").isArray()) {
+                            eventsArray = json.path("events");
+                        } else if (json.has("data") && json.path("data").isArray()) {
+                            eventsArray = json.path("data");
+                        }
+                    }
+
+                    if (eventsArray != null && eventsArray.size() > 0) {
+                        log.info("[Polymarket] ✅ Нашёл {} событий", eventsArray.size());
+                        return eventsArray;
+                    }
+                }
+
+            } catch (Exception e) {
+                log.error("[Polymarket] Ошибка запроса к {}: {}", url, e.getMessage());
+            }
+        }
+
+        log.error("[Polymarket] ❌ Не удалось найти рабочий endpoint");
+        return null;
+    }
+
     private JsonNode fetchEventDetails(String eventId) throws Exception {
         String url = API_BASE_URL + "/events/" + eventId;
 
@@ -124,169 +384,6 @@ public class PolymarketParser extends AbstractBookmakerParser {
         }
 
         return null;
-    }
-
-    /**
-     * Парсит событие с рынками
-     */
-    private RawEvent parseEventWithMarkets(JsonNode eventNode) {
-        try {
-            String title = eventNode.path("title").asText();
-            String eventId = eventNode.path("id").asText();
-            String slug = eventNode.path("slug").asText();
-
-            log.info("[Polymarket] Парсинг: {}", title);
-
-            // Извлекаем команды
-            String[] teams = extractTeamsFromEvent(eventNode);
-            String team1 = teams[0];
-            String team2 = teams[1];
-
-            if (team1.equals("Unknown") || team2.equals("Unknown")) {
-                log.warn("[Polymarket] Не удалось извлечь команды для: {}", title);
-                return null;
-            }
-
-            // Парсим рынки
-            List<RawEvent.RawMarket> markets = parseMarketsFromEvent(eventNode);
-            if (markets.isEmpty()) {
-                log.warn("[Polymarket] Нет рынков для: {}", title);
-                return null;
-            }
-
-            String league = "World Cup";
-            LocalDateTime startTime = parseStartDate(eventNode);
-            String url = "https://polymarket.com/event/" + slug;
-
-            log.info("[Polymarket] Команды: {} vs {}, рынков: {}", team1, team2, markets.size());
-
-            return new RawEvent(
-                    eventId,
-                    "Football",
-                    league,
-                    team1,
-                    team2,
-                    startTime,
-                    markets,
-                    url
-            );
-        } catch (Exception e) {
-            log.error("[Polymarket] Ошибка парсинга события: {}", e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Извлекает команды из события
-     */
-    private String[] extractTeamsFromEvent(JsonNode eventNode) {
-        // 1. Пробуем извлечь из teams
-        JsonNode teamsNode = eventNode.path("teams");
-        if (teamsNode.isArray() && teamsNode.size() >= 2) {
-            String team1 = teamsNode.get(0).path("name").asText();
-            String team2 = teamsNode.get(1).path("name").asText();
-            if (!team1.isEmpty() && !team2.isEmpty() && !team1.equals("null") && !team2.equals("null")) {
-                return new String[]{team1, team2};
-            }
-        }
-
-        // 2. Пробуем извлечь из title
-        String title = eventNode.path("title").asText();
-        if (title.contains(" vs ")) {
-            String[] parts = title.split(" vs ");
-            if (parts.length >= 2) {
-                String team1 = parts[0].trim();
-                String team2 = parts[1].trim();
-                if (!team1.isEmpty() && !team2.isEmpty()) {
-                    return new String[]{team1, team2};
-                }
-            }
-        }
-
-        // 3. Пробуем извлечь из markets - ищем команды в вопросах
-        JsonNode marketsNode = eventNode.path("markets");
-        if (marketsNode.isArray()) {
-            List<String> foundTeams = new ArrayList<>();
-            for (JsonNode market : marketsNode) {
-                String question = market.path("question").asText();
-                // Ищем паттерны с командами
-                for (String team : Arrays.asList("Switzerland", "Algeria", "Spain", "Austria",
-                        "Brazil", "Argentina", "France", "England", "Germany")) {
-                    if (question.contains(team) && !foundTeams.contains(team)) {
-                        foundTeams.add(team);
-                    }
-                }
-                if (foundTeams.size() >= 2) {
-                    return new String[]{foundTeams.get(0), foundTeams.get(1)};
-                }
-            }
-        }
-
-        return new String[]{"Unknown", "Unknown"};
-    }
-
-    /**
-     * Парсит рынки из события
-     */
-    private List<RawEvent.RawMarket> parseMarketsFromEvent(JsonNode eventNode) {
-        List<RawEvent.RawMarket> markets = new ArrayList<>();
-
-        JsonNode marketsNode = eventNode.path("markets");
-        if (!marketsNode.isArray() || marketsNode.size() == 0) {
-            return markets;
-        }
-
-        log.info("[Polymarket] Найдено {} рынков", marketsNode.size());
-
-        for (JsonNode marketNode : marketsNode) {
-            try {
-                String question = marketNode.path("question").asText();
-                log.debug("[Polymarket] Рынок: {}", question);
-
-                // Пропускаем вопросы с "Will" (это ставки Да/Нет)
-                if (question.toLowerCase().contains("will") && !question.toLowerCase().contains("vs")) {
-                    continue;
-                }
-
-                List<String> outcomes = parseJsonArray(marketNode.path("outcomes"));
-                List<String> prices = findPrices(marketNode);
-
-                if (outcomes.isEmpty() || prices.isEmpty() || outcomes.size() != prices.size()) {
-                    continue;
-                }
-
-                List<RawEvent.RawOutcome> rawOutcomes = new ArrayList<>();
-                for (int i = 0; i < outcomes.size(); i++) {
-                    try {
-                        String outcome = outcomes.get(i).trim();
-
-                        // Пропускаем Yes/No
-                        if (outcome.equalsIgnoreCase("yes") || outcome.equalsIgnoreCase("no") ||
-                                outcome.equalsIgnoreCase("will") || outcome.equalsIgnoreCase("won't") ||
-                                outcome.equalsIgnoreCase("true") || outcome.equalsIgnoreCase("false") ||
-                                outcome.matches("\\d+") || outcome.length() < 2) {
-                            continue;
-                        }
-
-                        double price = Double.parseDouble(prices.get(i));
-                        BigDecimal odds = convertPrice(price);
-                        rawOutcomes.add(new RawEvent.RawOutcome(outcome, odds));
-                    } catch (Exception e) {
-                        // Пропускаем
-                    }
-                }
-
-                if (!rawOutcomes.isEmpty()) {
-                    String type = determineMarketType(question, outcomes);
-                    markets.add(new RawEvent.RawMarket(type, rawOutcomes));
-                }
-
-            } catch (Exception e) {
-                log.debug("[Polymarket] Ошибка парсинга рынка: {}", e.getMessage());
-            }
-        }
-
-        return markets;
     }
 
     private List<String> findPrices(JsonNode marketNode) {
@@ -310,38 +407,6 @@ public class PolymarketParser extends AbstractBookmakerParser {
             return new BigDecimal("1.00");
         }
         return BigDecimal.valueOf(1.0 / price).setScale(2, RoundingMode.HALF_UP);
-    }
-
-    private String determineMarketType(String question, List<String> outcomes) {
-        String q = question.toLowerCase();
-
-        if (outcomes.size() == 2) {
-            String o1 = outcomes.get(0).toLowerCase();
-            String o2 = outcomes.get(1).toLowerCase();
-
-            if ((o1.equals("yes") && o2.equals("no")) || (o1.equals("no") && o2.equals("yes"))) {
-                if (q.contains("over") || q.contains("under")) {
-                    return "Total";
-                }
-                if (q.contains("both teams")) {
-                    return "BothTeamsToScore";
-                }
-                return "Winner";
-            }
-
-            if (o1.contains("over") || o2.contains("over") ||
-                    o1.contains("under") || o2.contains("under")) {
-                return "Total";
-            }
-
-            return "1X2";
-        }
-
-        if (outcomes.size() > 2) {
-            return "Outright";
-        }
-
-        return "Other";
     }
 
     private List<String> parseJsonArray(JsonNode node) {
